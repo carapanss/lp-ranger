@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# LP Ranger data (NEVER commit these)
+.keystore.enc
+config.json
+stats.json
+history.json
+daemon_state.json
+pending_proposal.json
+proposal_history.json
+last_decision.json
+*.log
+.lp-password
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

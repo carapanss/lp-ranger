@@ -1,0 +1,67 @@
+{
+  "name": "Exit Pool Strategy v1",
+  "version": "1.0.0",
+  "description": "Sale de pool en tendencias fuertes. Hold ETH (alcista) o USDC (bajista). Re-entra al lateralizar. Backtested: 164.6% APR, 12 rebalanceos.",
+  "strategy_type": "exit_pool",
+  "parameters": {
+    "base_width_pct": 15,
+    "trend_shift": 0.4,
+    "buffer_pct": 5,
+    "exit_trend_pct": 10,
+    "enter_trend_pct": 2,
+    "rsi_exit_high": 75,
+    "rsi_exit_low": 25,
+    "min_range_pct": 10,
+    "max_range_pct": 40
+  },
+  "backtest_results": {
+    "net_apr": 164.6,
+    "fee_apr": 105.1,
+    "total_fees_usd": 125.54,
+    "total_il_usd": 5.47,
+    "rebalance_count": 12,
+    "in_range_pct": 49.6,
+    "final_value_from_119_50": 316.23
+  },
+  "semaphore": {
+    "green": {
+      "edge_distance_min_pct": 15
+    },
+    "yellow": {
+      "edge_distance_min_pct": 5,
+      "conditions": [
+        "approaching_edge",
+        "moderate_trend"
+      ]
+    },
+    "red": {
+      "conditions": [
+        "out_of_range_beyond_buffer"
+      ]
+    },
+    "exit_eth": {
+      "conditions": [
+        "strong_bullish_trend"
+      ],
+      "description": "Cierra pool, hold ETH"
+    },
+    "exit_usdc": {
+      "conditions": [
+        "strong_bearish_trend"
+      ],
+      "description": "Cierra pool, hold USDC"
+    }
+  },
+  "data_sources": {
+    "price_api": "coingecko",
+    "price_pair": "ethereum/usd",
+    "poll_interval_seconds": 300,
+    "position_poll_interval_seconds": 900,
+    "indicators": {
+      "ema_fast": 20,
+      "ema_slow": 50,
+      "atr_period": 14,
+      "rsi_period": 14
+    }
+  }
+}

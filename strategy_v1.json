@@ -1,0 +1,37 @@
+{
+  "name": "Trend Following v1",
+  "version": "1.0.0",
+  "description": "Rango de 18% con desplazamiento por tendencia (EMA 20/50) y buffer del 5%. Backtested: 52.2% APR neto, 11 rebalanceos/año.",
+  "backtest_period": "2025-04-12 to 2026-04-11",
+  "backtest_results": {
+    "net_apr": 52.2,
+    "fee_apr": 82.5,
+    "total_fees_usd": 98.6,
+    "total_il_usd": 5.3,
+    "rebalance_count": 11,
+    "in_range_pct": 82.5
+  },
+  "pair": "WETH/USDC",
+  "chain": "base",
+  "protocol": "uniswap_v3",
+  "strategy_type": "trend_following",
+  "parameters": {
+    "base_width_pct": 18,
+    "trend_shift": 0.35,
+    "buffer_pct": 5,
+    "min_range_pct": 12,
+    "max_range_pct": 40
+  },
+  "semaphore": {
+    "green": { "edge_distance_min_pct": 15 },
+    "yellow": { "edge_distance_min_pct": 5 },
+    "red": { "conditions": ["out_of_range_beyond_buffer"] }
+  },
+  "data_sources": {
+    "price_api": "coingecko",
+    "price_pair": "ethereum/usd",
+    "poll_interval_seconds": 300,
+    "position_poll_interval_seconds": 900,
+    "indicators": { "ema_fast": 20, "ema_slow": 50, "atr_period": 14, "rsi_period": 14 }
+  }
+}

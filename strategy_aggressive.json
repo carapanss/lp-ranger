@@ -1,0 +1,36 @@
+{
+  "name": "Fixed Narrow (Agresiva)",
+  "version": "1.0.0",
+  "description": "Rango fijo de 10%, rebalancea inmediatamente. Máximas fees pero requiere cambio cada ~7 días. Backtested: 55.6% APR neto, 48 rebalanceos/año.",
+  "backtest_period": "2025-04-12 to 2026-04-11",
+  "backtest_results": {
+    "net_apr": 55.6,
+    "fee_apr": 179.5,
+    "total_fees_usd": 214.46,
+    "total_il_usd": 7.03,
+    "rebalance_count": 48,
+    "in_range_pct": 100.0
+  },
+  "pair": "WETH/USDC",
+  "chain": "base",
+  "protocol": "uniswap_v3",
+  "strategy_type": "fixed",
+  "parameters": {
+    "width_pct": 10,
+    "base_width_pct": 10,
+    "buffer_pct": 0,
+    "trend_shift": 0
+  },
+  "semaphore": {
+    "green": { "edge_distance_min_pct": 20 },
+    "yellow": { "edge_distance_min_pct": 8 },
+    "red": { "conditions": ["out_of_range"] }
+  },
+  "data_sources": {
+    "price_api": "coingecko",
+    "price_pair": "ethereum/usd",
+    "poll_interval_seconds": 300,
+    "position_poll_interval_seconds": 900,
+    "indicators": { "ema_fast": 20, "ema_slow": 50, "atr_period": 14, "rsi_period": 14 }
+  }
+}
