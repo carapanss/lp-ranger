@@ -321,34 +321,55 @@ Criterios: ¿El IL se recuperará? ¿La tendencia lo justifica? ¿No estamos sob
 # ============================================================
 # EXECUTOR
 # ============================================================
-def execute_action(action, state, password, dry_run=False):
-    """Execute an action via AutoBot."""
-    autobot = APP_DIR / "lp_autobot.py"
-    pid = state.get("position_id", "")
+def execute_action(action, state, password=None, pk=None, dry_run=False):
+    """Execute an action via AutoBot.
+
+    Prefers passing the already-decrypted private key via an anonymous pipe
+    FD (``--pk-fd``) so the subprocess never sees the keystore password.
+    Falls back to password-via-stdin only for backward compatibility.
+    """
+    autobot = str(APP_DIR / "lp_autobot.py")
+    pid = str(state.get("position_id", ""))
 
     if action["type"] == "rebalance":
-        cmd = f"python3 {autobot} --rebalance -p {pid} --price-lower {action['lo']:.0f} --price-upper {action['hi']:.0f}"
+        cmd = [sys.executable, autobot, "--rebalance", "-p", pid,
+               "--price-lower", f"{action['lo']:.0f}",
+               "--price-upper", f"{action['hi']:.0f}", "-y"]
     elif action["type"] == "exit_pool":
-        cmd = f"python3 {autobot} --exit -p {pid} --hold {action['hold']}"
+        cmd = [sys.executable, autobot, "--exit", "-p", pid,
+               "--hold", action["hold"], "-y"]
     elif action["type"] == "enter_pool":
-        cmd = f"python3 {autobot} --enter --price-lower {action['lo']:.0f} --price-upper {action['hi']:.0f}"
+        cmd = [sys.executable, autobot, "--enter",
+               "--price-lower", f"{action['lo']:.0f}",
+               "--price-upper", f"{action['hi']:.0f}", "-y"]
     else:
         log(f"Unknown action type: {action['type']}", "ERROR")
         return False
 
     if dry_run:
-        log(f"DRY RUN: Would execute: {cmd}")
+        log(f"DRY RUN: Would execute: {' '.join(cmd)}")
         return True
 
-    log(f"EXECUTING: {cmd}")
+    log(f"EXECUTING: {' '.join(cmd)}")
+    run_kwargs = dict(capture_output=True, text=True, timeout=300, cwd=str(APP_DIR))
     try:
-        # Run autobot with password piped in, and auto-confirm with 'y'
-        result = subprocess.run(
-            cmd.split(),
-            input=f"{password}\ny\n",
-            capture_output=True, text=True, timeout=300,
-            cwd=str(APP_DIR)
-        )
+        if pk:
+            r_fd, w_fd = os.pipe()
+            try:
+                os.write(w_fd, pk.encode())
+            finally:
+                os.close(w_fd)
+            try:
+                result = subprocess.run(
+                    cmd + ["--pk-fd", str(r_fd)],
+                    pass_fds=(r_fd,), **run_kwargs,
+                )
+            finally:
+                try: os.close(r_fd)
+                except OSError: pass
+        else:
+            result = subprocess.run(cmd, input=f"{password or ''}\n", **run_kwargs)
+
         log(f"AutoBot output: {result.stdout[-500:]}")
         if result.returncode == 0:
             log("Execution successful!")
@@ -371,15 +392,32 @@ def daemon_loop(args):
     if args.position_id:
         state.set("position_id", args.position_id)
 
-    # Get password for autobot
+    # Get password for autobot and derive the private key once, in-process.
+    # After derivation we drop the password entirely so Scrypt never runs
+    # again and the plaintext password is no longer in memory.
     password = None
+    pk = None
     if not args.dry_run:
         if args.password_file and Path(args.password_file).exists():
             with open(args.password_file) as f:
                 password = f.read().strip()
+            try:
+                os.chmod(args.password_file, 0o600)
+            except OSError:
+                pass
             log("Password loaded from file")
         else:
             password = getpass.getpass("AutoBot unlock password: ")
+        try:
+            import lp_autobot
+            pk = lp_autobot.decrypt_key(password)
+            log("Keystore unlocked; private key cached in memory for this session")
+        except Exception as e:
+            log(f"FATAL: cannot unlock keystore: {e}", "ERROR")
+            return
+        finally:
+            # Drop the plaintext password — we will only use the derived PK.
+            password = None
 
     log("="*50)
     log(f"LP Ranger Daemon started")
@@ -451,7 +489,7 @@ def daemon_loop(args):
                         approved = True
 
                 if approved:
-                    success = execute_action(action, state, password, args.dry_run)
+                    success = execute_action(action, state, pk=pk, dry_run=args.dry_run)
                     if success:
                         state.record_action()
                         # Update state based on action

@@ -68,74 +68,148 @@ SWAP_ROUTER_ABI = json.loads('''[
 ]''')
 
 # ============================================================
-# ENCRYPTED KEY STORAGE
+# ENCRYPTED KEY STORAGE — AES-256-GCM + Scrypt (keystore v2)
+#
+# Legacy v1 keystores (XOR-with-SHA256 + PBKDF2) still decrypt and are
+# migrated in place on the next successful unlock; a backup is kept in
+# .keystore.enc.legacy-backup.
 # ============================================================
 KEY_FILE = Path.home() / ".local" / "share" / "lp-ranger" / ".keystore.enc"
 
-def _derive_key(password, salt):
-    """Derive AES key from password using PBKDF2."""
-    return hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+# v2 binary layout:
+#   [4]  magic = b"LPR2"
+#   [1]  version = 0x01
+#   [1]  kdf_id  = 0x01 (scrypt)
+#   [2]  reserved (flags, currently 0x0000)
+#   [16] salt
+#   [12] nonce
+#   [..] ciphertext + GCM tag (AEAD appends a 16-byte tag)
+_KEYSTORE_MAGIC = b"LPR2"
+_KEYSTORE_VERSION = 0x01
+_KDF_SCRYPT = 0x01
+_KEYSTORE_HEADER_LEN = 4 + 1 + 1 + 2 + 16 + 12  # 36
+# Scrypt params: ~128 MB RAM, a few hundred ms on a modern CPU.
+# Tuned for once-per-session unlock; adjust with caution (see migration note).
+_SCRYPT_N = 2 ** 17
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_KEY_LEN = 32  # AES-256
+
+def _require_cryptography():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "Missing dependency 'cryptography'. Install with:\n"
+            "  pip install cryptography --break-system-packages"
+        ) from e
+
+def _scrypt_key(password: str, salt: bytes) -> bytes:
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    return Scrypt(
+        salt=salt, length=_KEY_LEN, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P
+    ).derive(password.encode())
+
+def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / (path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    os.chmod(path, mode)
 
 def encrypt_key(private_key, password):
-    """Encrypt private key with AES-256-CBC using password."""
+    """Encrypt private key with AES-256-GCM using a Scrypt-derived key."""
+    _require_cryptography()
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     import secrets
     salt = secrets.token_bytes(16)
-    iv = secrets.token_bytes(16)
-    key = _derive_key(password, salt)
-    
-    # Simple XOR-based encryption (no pycryptodome dependency)
-    # For production, use AES-256-CBC with pycryptodome
-    data = private_key.encode()
-    # Pad to 16-byte blocks
-    pad_len = 16 - (len(data) % 16)
-    data += bytes([pad_len]) * pad_len
-    
-    # XOR with expanded key stream (SHA-256 based)
-    encrypted = bytearray()
-    for i in range(0, len(data), 32):
-        block_key = hashlib.sha256(key + iv + i.to_bytes(4, 'big')).digest()
-        chunk = data[i:i+32]
-        encrypted.extend(b ^ k for b, k in zip(chunk, block_key[:len(chunk)]))
-    
-    # Verify tag
-    tag = hashlib.sha256(key + bytes(encrypted)).digest()[:16]
-    
-    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(KEY_FILE, 'wb') as f:
-        f.write(salt + iv + tag + bytes(encrypted))
-    os.chmod(KEY_FILE, 0o600)
-    print(f"[KeyStore] Key encrypted and saved to {KEY_FILE}")
+    nonce = secrets.token_bytes(12)
+    key = _scrypt_key(password, salt)
+    ct = AESGCM(key).encrypt(nonce, private_key.encode(), None)
+    header = _KEYSTORE_MAGIC + bytes([_KEYSTORE_VERSION, _KDF_SCRYPT, 0x00, 0x00])
+    _atomic_write(KEY_FILE, header + salt + nonce + ct)
+    print(f"[KeyStore] Key encrypted (AES-256-GCM) and saved to {KEY_FILE}")
 
-def decrypt_key(password):
-    """Decrypt private key with password."""
-    if not KEY_FILE.exists():
-        raise FileNotFoundError("No encrypted key found. Run --setup first.")
-    
-    with open(KEY_FILE, 'rb') as f:
-        raw = f.read()
-    
+def _decrypt_v2(raw: bytes, password: str) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.exceptions import InvalidTag
+    if len(raw) < _KEYSTORE_HEADER_LEN + 16:
+        raise ValueError("Corrupted keystore (truncated)")
+    version = raw[4]
+    kdf_id = raw[5]
+    if version != _KEYSTORE_VERSION:
+        raise ValueError(f"Unsupported keystore version: {version}")
+    if kdf_id != _KDF_SCRYPT:
+        raise ValueError(f"Unsupported KDF id: {kdf_id}")
+    salt = raw[8:24]
+    nonce = raw[24:36]
+    ct = raw[36:]
+    key = _scrypt_key(password, salt)
+    try:
+        pt = AESGCM(key).decrypt(nonce, ct, None)
+    except InvalidTag:
+        raise ValueError("Wrong password or corrupted keystore")
+    return pt.decode()
+
+def _decrypt_legacy_v1(raw: bytes, password: str) -> str:
+    """Legacy XOR+SHA256 keystore (v1). Kept only to enable migration to v2."""
+    if len(raw) < 48:
+        raise ValueError("Corrupted keystore (truncated)")
     salt = raw[:16]
     iv = raw[16:32]
     tag = raw[32:48]
     encrypted = raw[48:]
-    
-    key = _derive_key(password, salt)
-    
-    # Verify tag
+    key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
     expected_tag = hashlib.sha256(key + encrypted).digest()[:16]
     if tag != expected_tag:
         raise ValueError("Wrong password or corrupted keystore")
-    
-    # Decrypt
     decrypted = bytearray()
     for i in range(0, len(encrypted), 32):
         block_key = hashlib.sha256(key + iv + i.to_bytes(4, 'big')).digest()
         chunk = encrypted[i:i+32]
         decrypted.extend(b ^ k for b, k in zip(chunk, block_key[:len(chunk)]))
-    
-    # Remove PKCS7 padding
     pad_len = decrypted[-1]
     return decrypted[:-pad_len].decode()
+
+def decrypt_key(password):
+    """Decrypt private key.
+
+    Transparently supports v2 (AES-256-GCM) and legacy v1 (XOR) keystores.
+    Legacy v1 keystores are re-encrypted to v2 in place on first successful
+    unlock; the original file is copied to ``.keystore.enc.legacy-backup``.
+    """
+    if not KEY_FILE.exists():
+        raise FileNotFoundError("No encrypted key found. Run --setup first.")
+    with open(KEY_FILE, "rb") as f:
+        raw = f.read()
+    if raw.startswith(_KEYSTORE_MAGIC):
+        _require_cryptography()
+        return _decrypt_v2(raw, password)
+
+    # Legacy path. Decrypt first, then attempt in-place upgrade.
+    pk = _decrypt_legacy_v1(raw, password)
+    try:
+        _require_cryptography()
+        backup = KEY_FILE.with_name(KEY_FILE.name + ".legacy-backup")
+        if not backup.exists():
+            with open(backup, "wb") as f:
+                f.write(raw)
+            os.chmod(backup, 0o600)
+        encrypt_key(pk, password)
+        print(
+            f"[KeyStore] Legacy keystore migrated to AES-256-GCM. "
+            f"Backup saved to {backup}."
+        )
+    except Exception as e:
+        # Migration is best-effort; never block unlock on it.
+        print(
+            f"[KeyStore] WARNING: legacy keystore in use, migration to v2 failed: {e}",
+            file=sys.stderr,
+        )
+    return pk
 
 
 # ============================================================
@@ -685,19 +759,42 @@ def main():
     parser.add_argument("--fee", type=int, default=500, help="Pool fee tier (default: 500 = 0.05%%)")
     parser.add_argument("--dry-run", action="store_true", help="Simulate without executing")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompts")
+    parser.add_argument(
+        "--pk-fd",
+        type=int,
+        default=None,
+        help=(
+            "Read the already-decrypted private key (hex) from this file descriptor "
+            "instead of prompting for the keystore password. Used by the GUI/daemon "
+            "to avoid shipping the password into subprocess memory."
+        ),
+    )
     args = parser.parse_args()
-    
+
     if args.setup:
         setup_key()
         return
-    
-    # Unlock key
-    password = getpass.getpass("Unlock password: ")
-    try:
-        pk = decrypt_key(password)
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return
+
+    # Unlock key. Preferred path: parent process has already decrypted the key
+    # and passes it via a dedicated pipe FD — this keeps the password out of
+    # the subprocess's address space entirely. Fallback: interactive password.
+    if args.pk_fd is not None:
+        try:
+            with os.fdopen(args.pk_fd, "r", closefd=True) as fd:
+                pk = fd.read().strip()
+        except OSError as e:
+            print(f"ERROR: cannot read private key from fd {args.pk_fd}: {e}")
+            return
+        if not pk.startswith("0x") or len(pk) != 66:
+            print("ERROR: Invalid private key received on --pk-fd")
+            return
+    else:
+        password = getpass.getpass("Unlock password: ")
+        try:
+            pk = decrypt_key(password)
+        except Exception as e:
+            print(f"ERROR: {e}")
+            return
     
     bot = TxBuilder(pk)
     

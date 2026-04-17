@@ -23,6 +23,40 @@ APP_DIR = Path(__file__).parent.resolve()
 ICONS_DIR = APP_DIR / "icons"
 DATA_DIR = Path.home() / ".local" / "share" / "lp-ranger"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    os.chmod(DATA_DIR, 0o700)
+except OSError:
+    pass
+
+
+def _run_autobot(cmd, password=None, pk=None, **subprocess_kwargs):
+    """Run lp_autobot.py as a subprocess without exposing the password.
+
+    Preferred path: the parent has already decrypted the private key (``pk``)
+    and we pass it through an anonymous pipe (``--pk-fd N``). The password
+    never enters the child's address space, and Scrypt does not run again.
+
+    Fallback path: if only the password is known, we still pipe it via stdin
+    for backward compatibility.
+    """
+    kwargs = dict(capture_output=True, text=True, timeout=600, cwd=str(APP_DIR))
+    kwargs.update(subprocess_kwargs)
+    if pk:
+        r_fd, w_fd = os.pipe()
+        try:
+            os.write(w_fd, pk.encode())
+        finally:
+            os.close(w_fd)
+        full_cmd = list(cmd) + ["--pk-fd", str(r_fd)]
+        try:
+            return subprocess.run(full_cmd, pass_fds=(r_fd,), **kwargs)
+        finally:
+            try:
+                os.close(r_fd)
+            except OSError:
+                pass
+    stdin_data = f"{password or ''}\n"
+    return subprocess.run(cmd, input=stdin_data, **kwargs)
 CONFIG_FILE = DATA_DIR / "config.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 STATS_FILE = DATA_DIR / "stats.json"
@@ -35,34 +69,52 @@ BINANCE = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDC"
 COOLDOWN_H = 4
 
 # ── helpers ──
+def _load_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if data is not None else default
+    except Exception:
+        return default
+
+def _write_json(path, data, mode=0o600):
+    """Atomically write JSON to ``path`` with restrictive permissions."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
 class Cfg:
     def __init__(self):
         self.c = {"position_id":"","strategy_file":str(DEFAULT_STRAT),"notifications":True,"range_lo":0,"range_hi":0}
-        if CONFIG_FILE.exists():
-            try: self.c.update(json.load(open(CONFIG_FILE)))
-            except: pass
-    def save(self): json.dump(self.c,open(CONFIG_FILE,"w"),indent=2)
+        loaded = _load_json(CONFIG_FILE, {})
+        if isinstance(loaded, dict):
+            self.c.update(loaded)
+    def save(self): _write_json(CONFIG_FILE, self.c)
     def get(self,k,d=None): return self.c.get(k,d)
     def set(self,k,v): self.c[k]=v; self.save()
 
 class Hist:
     def __init__(self):
-        self.h=[]
-        if HISTORY_FILE.exists():
-            try: self.h=json.load(open(HISTORY_FILE))
-            except: pass
+        self.h = _load_json(HISTORY_FILE, [])
+        if not isinstance(self.h, list):
+            self.h = []
     def log(self,t,m,**kw):
         self.h.append({"ts":datetime.now().isoformat()[:16],"type":t,"msg":m,**kw})
-        self.h=self.h[-500:]; json.dump(self.h,open(HISTORY_FILE,"w"),indent=2)
+        self.h = self.h[-500:]
+        _write_json(HISTORY_FILE, self.h)
     def recent(self,n=20): return self.h[-n:]
 
 class Stats:
     def __init__(self):
         self.d={"total_fees":0,"fees_today":0,"fees_today_date":"","total_il":0,"il_segments":[],"pool_active":True,"hold_asset":None}
-        if STATS_FILE.exists():
-            try: self.d.update(json.load(open(STATS_FILE)))
-            except: pass
-    def save(self): json.dump(self.d,open(STATS_FILE,"w"),indent=2)
+        loaded = _load_json(STATS_FILE, {})
+        if isinstance(loaded, dict):
+            self.d.update(loaded)
+    def save(self): _write_json(STATS_FILE, self.d)
     def get(self,k,d=None): return self.d.get(k,d)
     def set(self,k,v): self.d[k]=v; self.save()
     def add_fees(self,a):
@@ -223,7 +275,11 @@ class Term(Gtk.Box):
     def __init__(self, app):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.app = app
-        self._cached_pw = None  # Password cached in memory for session
+        # Password is kept in memory only until we successfully derive the
+        # private key; after that we hold the hex PK instead and wipe the
+        # password so Scrypt never runs a second time during the session.
+        self._cached_pw = None
+        self._cached_pk = None
         self.buf = Gtk.TextBuffer()
         self.tv = Gtk.TextView(buffer=self.buf)
         self.tv.set_editable(False); self.tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR); self.tv.set_cursor_visible(False)
@@ -304,14 +360,23 @@ class Term(Gtk.Box):
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
             pw = pw_entry.get_text()
-            if remember.get_active():
-                self._cached_pw = pw
-            else:
-                self._cached_pw = None
             dialog.destroy()
-            self.wl("Password OK — ejecutando...","blue")
-            # Now run the command with the password
-            threading.Thread(target=self._exec, args=(pending_cmd, pw), daemon=True).start()
+            # Derive the private key once, in this process, and cache only the PK.
+            try:
+                import lp_autobot
+                pk = lp_autobot.decrypt_key(pw)
+            except Exception as e:
+                self._cached_pw = None
+                self._cached_pk = None
+                self.wl(f"Password incorrecto: {e}", "red")
+                return
+            if remember.get_active():
+                self._cached_pk = pk
+            else:
+                self._cached_pk = None
+            self._cached_pw = None
+            self.wl("Password OK — ejecutando...", "blue")
+            threading.Thread(target=self._exec, args=(pending_cmd,), daemon=True).start()
         else:
             dialog.destroy()
             self.wl("Cancelado","yellow")
@@ -319,6 +384,7 @@ class Term(Gtk.Box):
     def _exec(self, cmd, password=None):
         parts=cmd.split();verb=parts[0].lower() if parts else ""
         autobot=str(APP_DIR/"lp_autobot.py");pid=self.app.config.get("position_id","")
+        pk = self._cached_pk
         pw = password or self._cached_pw or ""
         try:
             if verb=="help":
@@ -336,11 +402,13 @@ class Term(Gtk.Box):
             if verb=="clear": GLib.idle_add(self.buf.set_text,"");return
             if verb=="unlock":
                 self._cached_pw = None
+                self._cached_pk = None
                 GLib.idle_add(self._ask_password, "status")
                 return
             if verb=="forget":
                 self._cached_pw = None
-                GLib.idle_add(self.wl,"Password borrado de memoria","yellow")
+                self._cached_pk = None
+                GLib.idle_add(self.wl,"Credenciales borradas de memoria","yellow")
                 return
             if verb in ("reset-fees","resetfees","reset"):
                 self.app.stats.d["total_fees"]=0;self.app.stats.d["fees_today"]=0;self.app.stats.d["total_il"]=0
@@ -359,9 +427,9 @@ class Term(Gtk.Box):
             elif verb=="enter":full=[sys.executable,autobot,"--enter","-y"]+parts[1:]
             else:GLib.idle_add(self.wl,f"Comando no reconocido: {verb}. Escribe help","red");return
             GLib.idle_add(self.wl,"Ejecutando...","blue")
-            # Send password + auto-confirm via stdin
-            stdin_data = f"{pw}\n"
-            r=subprocess.run(full,capture_output=True,text=True,timeout=600,input=stdin_data,cwd=str(APP_DIR))
+            # Prefer passing the already-decrypted PK via FD so the password
+            # never enters the subprocess memory.
+            r = _run_autobot(full, password=pw, pk=pk)
             for line in (r.stdout+r.stderr).split("\n"):
                 if not line.strip(): continue
                 # Filter out noise warnings
@@ -376,6 +444,7 @@ class Term(Gtk.Box):
                 GLib.idle_add(self.wl,line,tag)
             if r.returncode != 0 and "Wrong password" in (r.stdout+r.stderr):
                 self._cached_pw = None
+                self._cached_pk = None
                 GLib.idle_add(self.wl,"Password incorrecto. Usa 'unlock' para reintentar.","red")
         except subprocess.TimeoutExpired:
             GLib.idle_add(self.wl,"Timeout (10 min)","red")
@@ -653,11 +722,16 @@ class App:
             if el>COOLDOWN_H*3600 or self.last_rec is None:
                 self.last_rec=rec;self.last_rec_time=time.time()
                 if self.term:self.term.wl(f"Senal: {rec.get('type','')} — {rec.get('reason','')}","yellow")
-                # Write proposal file for bridge
-                try:json.dump({"type":rec.get("type",""),"timestamp":datetime.now().isoformat()[:19],"current_price":p,"proposed_lo":rec.get("lo",0),"proposed_hi":rec.get("hi",0),"proposed_width":rec.get("width_pct",0),"hold_asset":rec.get("hold",""),"reason":rec.get("reason",""),"ema_fast":det.get("ema_fast",0),"ema_slow":det.get("ema_slow",0),"trend":det.get("trend",""),"trend_pct":det.get("trend_pct",0),"rsi":det.get("rsi",50),"volatility_pct":det.get("volatility_pct",0)},open(DATA_DIR/"pending_proposal.json","w"),indent=2)
-                except:pass
-                # AUTO-EXECUTE if password is cached
-                if self.term and self.term._cached_pw:
+                # Write proposal file for bridge (0600 — contains position data).
+                try:
+                    proposal_path = DATA_DIR / "pending_proposal.json"
+                    with open(proposal_path, "w") as pf:
+                        json.dump({"type":rec.get("type",""),"timestamp":datetime.now().isoformat()[:19],"current_price":p,"proposed_lo":rec.get("lo",0),"proposed_hi":rec.get("hi",0),"proposed_width":rec.get("width_pct",0),"hold_asset":rec.get("hold",""),"reason":rec.get("reason",""),"ema_fast":det.get("ema_fast",0),"ema_slow":det.get("ema_slow",0),"trend":det.get("trend",""),"trend_pct":det.get("trend_pct",0),"rsi":det.get("rsi",50),"volatility_pct":det.get("volatility_pct",0)}, pf, indent=2)
+                    os.chmod(proposal_path, 0o600)
+                except Exception:
+                    pass
+                # AUTO-EXECUTE if credentials are cached (prefer derived PK)
+                if self.term and (self.term._cached_pk or self.term._cached_pw):
                     self._auto_execute(rec, det)
         imap={"green":"green","yellow":"yellow","red":"red","exit_eth":"red","exit_usdc":"red","closed_eth":"yellow","closed_usdc":"yellow","gray":"gray"}
         if self.ind:
@@ -673,6 +747,7 @@ class App:
         """Auto-execute a signal via lp_autobot."""
         rtype = rec.get("type","")
         pid = self.config.get("position_id","")
+        pk = self.term._cached_pk
         pw = self.term._cached_pw
         autobot = str(APP_DIR / "lp_autobot.py")
 
@@ -704,10 +779,9 @@ class App:
                     GLib.idle_add(self.term.wl, f"  Tipo desconocido: {rtype}", "red")
                     return
 
-                # Execute with password (no confirmation needed thanks to -y)
-                stdin_data = f"{pw}\n"
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
-                                   input=stdin_data, cwd=str(APP_DIR))
+                # Execute — prefer PK-via-FD over password-via-stdin so the
+                # password never reaches the subprocess.
+                r = _run_autobot(cmd, password=pw, pk=pk)
 
                 # Show output (filtered)
                 for line in (r.stdout + r.stderr).split("\n"):
