@@ -18,6 +18,7 @@ import json, os, sys, math, time, threading, subprocess, re
 from datetime import datetime
 from pathlib import Path
 import urllib.request
+import lp_core
 
 APP_DIR = Path(__file__).parent.resolve()
 ICONS_DIR = APP_DIR / "icons"
@@ -137,22 +138,11 @@ class Stats:
                    - self.d.get("total_il", 0),
                    1.0)
     def record_il(self,olo,ohi,nlo,nhi,p):
-        """Record IL for a rebalance/exit. Uses standard V2 IL formula scaled
-        by current position value, with a V3 concentration amplifier bounded
-        to avoid runaway estimates for narrow ranges near an edge."""
-        if olo<=0 or ohi<=0 or p<=0:
+        """Record IL for a rebalance/exit. Delegates the math to
+        ``lp_core.il_estimate`` so the formula is unit-tested."""
+        il_pct, il_usd = lp_core.il_estimate(olo, ohi, p, self._position_value())
+        if il_usd == 0:
             self.save(); return 0
-        entry=(olo+ohi)/2
-        if entry<=0:
-            self.save(); return 0
-        r=p/entry
-        # Standard V2 IL: 2*sqrt(r)/(1+r) - 1 (always ≤ 0)
-        il_v2=abs(2*math.sqrt(r)/(1+r)-1) if r>0 else 0
-        # V3 concentration amplifier, capped (narrow ranges amplify IL)
-        width_pct=(ohi-olo)/entry*100
-        amp=min(math.sqrt(100/max(width_pct,5)), 4.0)
-        il_pct=min(il_v2*amp, 0.20)  # cap at 20% per rebalance
-        il_usd=il_pct*self._position_value()
         self.d["total_il"]+=il_usd
         self.d["il_segments"].append({
             "date":datetime.now().isoformat()[:16],
@@ -223,40 +213,7 @@ class Fetcher:
             self.error="Posicion no encontrada";return False
         except Exception as e: self.error=str(e);return False
 
-def _validate_strategy(cfg):
-    """Validate a strategy config dict. Returns list of error strings (empty = valid)."""
-    errors = []
-    if not isinstance(cfg, dict):
-        return ["strategy must be a JSON object"]
-    st = cfg.get("strategy_type")
-    if st not in ("exit_pool", "trend_following", "fixed"):
-        errors.append(f"strategy_type must be one of exit_pool|trend_following|fixed (got {st!r})")
-    params = cfg.get("parameters", {})
-    if not isinstance(params, dict):
-        errors.append("parameters must be an object"); params = {}
-    bw = params.get("base_width_pct", params.get("width_pct"))
-    if bw is not None:
-        try:
-            if not (1 <= float(bw) <= 100):
-                errors.append(f"base_width_pct/width_pct must be in [1,100] (got {bw})")
-        except (TypeError, ValueError):
-            errors.append(f"base_width_pct/width_pct must be numeric (got {bw!r})")
-    for key, lo, hi in (("buffer_pct",0,50),("trend_shift",0,2),("exit_trend_pct",0,50),("enter_trend_pct",0,50)):
-        v = params.get(key)
-        if v is None: continue
-        try:
-            if not (lo <= float(v) <= hi):
-                errors.append(f"{key} must be in [{lo},{hi}] (got {v})")
-        except (TypeError, ValueError):
-            errors.append(f"{key} must be numeric (got {v!r})")
-    ds = cfg.get("data_sources", {})
-    ind = ds.get("indicators", {}) if isinstance(ds, dict) else {}
-    for key in ("ema_fast","ema_slow","atr_period","rsi_period"):
-        v = ind.get(key)
-        if v is None: continue
-        if not (isinstance(v, int) and v > 0):
-            errors.append(f"indicators.{key} must be a positive integer (got {v!r})")
-    return errors
+_validate_strategy = lp_core.validate_strategy
 
 class Strat:
     DEFAULT_CFG = {"name":"Default","strategy_type":"exit_pool","parameters":{"base_width_pct":15,"trend_shift":0.4,"buffer_pct":5,"exit_trend_pct":10,"enter_trend_pct":2}}
@@ -281,33 +238,10 @@ class Strat:
         self.cfg=cfg
     def add(self,p):self.prices.append((time.time(),p));self.prices=[(t,v) for t,v in self.prices if t>time.time()-60*86400]
     def _prices(self): return [p for _,p in self.prices]
-    def _warm(self, ic):
-        """Have we seen enough data for all requested indicators to be meaningful?"""
-        need = max(int(ic.get("ema_slow",50)), int(ic.get("rsi_period",14))+1, int(ic.get("atr_period",14))+1)
-        return len(self.prices) >= need
-    def _ema(self,per):
-        ps=self._prices()
-        if len(ps)<per: return None
-        k=2/(per+1); e=sum(ps[:per])/per
-        for p in ps[per:]: e=p*k+e*(1-k)
-        return e
-    def _atr(self,per=14):
-        ps=self._prices()
-        if len(ps)<per+1: return None
-        ts=[abs(ps[i]-ps[i-1]) for i in range(1,len(ps))]
-        a=sum(ts[:per])/per
-        for t in ts[per:]: a=(a*(per-1)+t)/per
-        return a
-    def _rsi(self,per=14):
-        ps=self._prices()
-        if len(ps)<per+1: return None
-        ds=[ps[i]-ps[i-1] for i in range(1,len(ps))]
-        gs=[max(d,0) for d in ds]; ls=[max(-d,0) for d in ds]
-        ag=sum(gs[:per])/per; al=sum(ls[:per])/per
-        for i in range(per,len(ds)):
-            ag=(ag*(per-1)+gs[i])/per; al=(al*(per-1)+ls[i])/per
-        if al==0: return 100 if ag>0 else 50
-        return 100-(100/(1+ag/al))
+    def _warm(self, ic): return len(self.prices) >= lp_core.warm_samples(ic)
+    def _ema(self,per): return lp_core.ema(self._prices(), per)
+    def _atr(self,per=14): return lp_core.atr(self._prices(), per)
+    def _rsi(self,per=14): return lp_core.rsi(self._prices(), per)
     def evaluate(self,price,rlo,rhi,pool_active=True,hold=None):
         if price<=0:return "gray",None,{"message":"Esperando datos..."}
         p=self.cfg.get("parameters",{});ic=self.cfg.get("data_sources",{}).get("indicators",{})
@@ -786,6 +720,7 @@ class App:
         self.config=Cfg();self.strategy=Strat(self.config.get("strategy_file"))
         self.fetcher=Fetcher();self.history=Hist();self.stats=Stats()
         self.status="gray";self.last_rec=None;self.last_rec_time=0;self.window=None;self.term=None
+        self.last_rec_time_by_type={}  # {action_type: unix_ts} for per-action cooldown
         self._last_fee_time=0  # Track when we last added fees
         if AppIndicator3:
             self.ind=AppIndicator3.Indicator.new("lp-ranger",str(ICONS_DIR/"gray.png"),AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
@@ -846,9 +781,14 @@ class App:
                 self.stats.add_fees(per_5min)
         old=self.status;self.status=status
         if rec:
-            el=time.time()-self.last_rec_time
+            now=time.time()
+            rtype=rec.get("type","")
+            last_same=self.last_rec_time_by_type.get(rtype,0)
+            last_any=self.last_rec_time
+            el=now-max(last_same,last_any)
             if el>COOLDOWN_H*3600 or self.last_rec is None:
-                self.last_rec=rec;self.last_rec_time=time.time()
+                self.last_rec=rec;self.last_rec_time=now
+                if rtype: self.last_rec_time_by_type[rtype]=now
                 if self.term:self.term.wl(f"Senal: {rec.get('type','')} — {rec.get('reason','')}","yellow")
                 # Write proposal file for bridge (0600 — contains position data).
                 try:

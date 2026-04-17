@@ -17,10 +17,12 @@ USAGE:
   python3 lp_daemon.py -p 4950738 --dry-run
 """
 
-import json, os, sys, math, time, subprocess, shutil, getpass
+import json, os, sys, math, time, subprocess, shutil, getpass, logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
 import urllib.request
+import lp_core
 
 # ============================================================
 # CONFIG
@@ -51,12 +53,24 @@ MAX_ACTIONS_PER_DAY = 3   # Safety: max 3 rebalances per day
 # ============================================================
 # LOGGING
 # ============================================================
+_LOGGER = logging.getLogger("lp_daemon")
+if not _LOGGER.handlers:
+    _LOGGER.setLevel(logging.INFO)
+    _fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
+                             datefmt="%Y-%m-%d %H:%M:%S")
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5)
+    _fh.setFormatter(_fmt)
+    _ch = logging.StreamHandler()
+    _ch.setFormatter(_fmt)
+    _LOGGER.addHandler(_fh)
+    _LOGGER.addHandler(_ch)
+
+_LEVEL_MAP = {"INFO": logging.INFO, "WARN": logging.WARNING,
+              "WARNING": logging.WARNING, "ERROR": logging.ERROR,
+              "DEBUG": logging.DEBUG}
+
 def log(msg, level="INFO"):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] [{level}] {msg}"
-    print(line)
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
+    _LOGGER.log(_LEVEL_MAP.get(level, logging.INFO), msg)
 
 # ============================================================
 # STATE MANAGEMENT
@@ -68,6 +82,7 @@ class State:
             "range_lo": 0, "range_hi": 0,
             "pool_active": True, "hold_asset": None,
             "last_action_time": 0,
+            "last_action_by_type": {},  # {action_type: unix_ts}
             "actions_today": 0, "actions_today_date": "",
             "total_fees": 0, "total_il": 0,
             "price_history": [],
@@ -88,8 +103,9 @@ class State:
     def get(self, k, d=None): return self.data.get(k, d)
     def set(self, k, v): self.data[k] = v; self.save()
 
-    def can_act(self):
-        """Check cooldown and daily limits."""
+    def can_act(self, action_type=None):
+        """Check cooldown and daily limits. If action_type is supplied, apply
+        a per-type cooldown; otherwise fall back to the global cooldown."""
         now = time.time()
         today = datetime.now().strftime("%Y-%m-%d")
         if self.data["actions_today_date"] != today:
@@ -97,14 +113,23 @@ class State:
             self.data["actions_today_date"] = today
         if self.data["actions_today"] >= MAX_ACTIONS_PER_DAY:
             return False, f"Daily limit reached ({MAX_ACTIONS_PER_DAY})"
-        elapsed = now - self.data.get("last_action_time", 0)
+        by_type = self.data.get("last_action_by_type", {}) or {}
+        last_same = by_type.get(action_type, 0) if action_type else 0
+        last_global = self.data.get("last_action_time", 0)
+        last = max(last_same, last_global)
+        elapsed = now - last
         if elapsed < COOLDOWN_SECONDS:
             remaining = (COOLDOWN_SECONDS - elapsed) / 3600
-            return False, f"Cooldown: {remaining:.1f}h remaining"
+            scope = f" for {action_type}" if action_type else ""
+            return False, f"Cooldown{scope}: {remaining:.1f}h remaining"
         return True, "OK"
 
-    def record_action(self):
-        self.data["last_action_time"] = time.time()
+    def record_action(self, action_type=None):
+        now = time.time()
+        self.data["last_action_time"] = now
+        if action_type:
+            by_type = self.data.setdefault("last_action_by_type", {})
+            by_type[action_type] = now
         self.data["actions_today"] += 1
         self.save()
 
@@ -175,40 +200,7 @@ def fetch_position(pid):
 # ============================================================
 # STRATEGY ENGINE (embedded, no GTK dependency)
 # ============================================================
-def _validate_strategy(cfg):
-    """Validate a strategy config dict. Returns list of error strings (empty = valid)."""
-    errors = []
-    if not isinstance(cfg, dict):
-        return ["strategy must be a JSON object"]
-    st = cfg.get("strategy_type")
-    if st not in ("exit_pool", "trend_following", "fixed"):
-        errors.append(f"strategy_type must be one of exit_pool|trend_following|fixed (got {st!r})")
-    params = cfg.get("parameters", {})
-    if not isinstance(params, dict):
-        errors.append("parameters must be an object"); params = {}
-    bw = params.get("base_width_pct", params.get("width_pct"))
-    if bw is not None:
-        try:
-            if not (1 <= float(bw) <= 100):
-                errors.append(f"base_width_pct/width_pct must be in [1,100] (got {bw})")
-        except (TypeError, ValueError):
-            errors.append(f"base_width_pct/width_pct must be numeric (got {bw!r})")
-    for key, lo, hi in (("buffer_pct",0,50),("trend_shift",0,2),("exit_trend_pct",0,50),("enter_trend_pct",0,50)):
-        v = params.get(key)
-        if v is None: continue
-        try:
-            if not (lo <= float(v) <= hi):
-                errors.append(f"{key} must be in [{lo},{hi}] (got {v})")
-        except (TypeError, ValueError):
-            errors.append(f"{key} must be numeric (got {v!r})")
-    ds = cfg.get("data_sources", {})
-    ind = ds.get("indicators", {}) if isinstance(ds, dict) else {}
-    for key in ("ema_fast","ema_slow","atr_period","rsi_period"):
-        v = ind.get(key)
-        if v is None: continue
-        if not (isinstance(v, int) and v > 0):
-            errors.append(f"indicators.{key} must be a positive integer (got {v!r})")
-    return errors
+_validate_strategy = lp_core.validate_strategy
 
 
 class Strategy:
@@ -242,7 +234,7 @@ class Strategy:
         ic = self.cfg.get("data_sources",{}).get("indicators",{})
 
         prices = [x["p"] for x in price_history]
-        need = max(int(ic.get("ema_slow",50)), int(ic.get("rsi_period",14))+1, int(ic.get("atr_period",14))+1)
+        need = lp_core.warm_samples(ic)
         if len(prices) < need:
             return "gray", None, {"message": f"Warming up ({len(prices)}/{need} samples)", "warming_up": True}
 
@@ -317,26 +309,9 @@ class Strategy:
 
         return "green", None, det
 
-    def _ema(self, prices, per):
-        if len(prices) < per: return None
-        k=2/(per+1); e=sum(prices[:per])/per
-        for p in prices[per:]: e=p*k+e*(1-k)
-        return e
-    def _atr(self, prices, per):
-        if len(prices) < per+1: return None
-        trs=[abs(prices[i]-prices[i-1]) for i in range(1,len(prices))]
-        a=sum(trs[:per])/per
-        for t in trs[per:]: a=(a*(per-1)+t)/per
-        return a
-    def _rsi(self, prices, per):
-        if len(prices)<per+1: return None
-        ds=[prices[i]-prices[i-1] for i in range(1,len(prices))]
-        gs=[max(d,0) for d in ds]; ls=[max(-d,0) for d in ds]
-        ag=sum(gs[:per])/per; al=sum(ls[:per])/per
-        for i in range(per,len(ds)):
-            ag=(ag*(per-1)+gs[i])/per; al=(al*(per-1)+ls[i])/per
-        if al==0: return 100 if ag>0 else 50
-        return 100-(100/(1+ag/al))
+    def _ema(self, prices, per): return lp_core.ema(prices, per)
+    def _atr(self, prices, per): return lp_core.atr(prices, per)
+    def _rsi(self, prices, per): return lp_core.rsi(prices, per)
 
 # ============================================================
 # CLAUDE CODE INTEGRATION
@@ -539,7 +514,7 @@ def daemon_loop(args):
 
             # 4. Act if there's a signal
             if action:
-                can, reason = state.can_act()
+                can, reason = state.can_act(action_type=action.get("type"))
                 if not can:
                     log(f"  Signal: {action['type']} but {reason}")
                     time.sleep(POLL_SECONDS); continue
@@ -556,7 +531,7 @@ def daemon_loop(args):
                     elif claude_result is False:
                         log("  ❌ Claude REJECTED")
                         approved = False
-                        state.record_action()  # Count as action to avoid spam
+                        state.record_action(action_type=action.get("type"))  # Count as action to avoid spam
                     else:
                         log("  ⚠️ Claude unavailable, using auto-execute rules")
                         # Fallback: auto-approve if conservative checks pass
@@ -565,7 +540,7 @@ def daemon_loop(args):
                 if approved:
                     success = execute_action(action, state, pk=pk, dry_run=args.dry_run)
                     if success:
-                        state.record_action()
+                        state.record_action(action_type=action.get("type"))
                         # Update state based on action
                         if action["type"] == "exit_pool":
                             state.set("pool_active", False)
