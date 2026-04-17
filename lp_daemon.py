@@ -32,7 +32,14 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "daemon.log"
 STATE_FILE = DATA_DIR / "daemon_state.json"
 
-BASE_RPC = "https://mainnet.base.org"
+_DEFAULT_RPCS = [
+    "https://mainnet.base.org",
+    "https://base.publicnode.com",
+    "https://base.llamarpc.com",
+]
+_env_rpcs = os.environ.get("LP_RPC_ENDPOINTS", "")
+RPC_ENDPOINTS = [u.strip() for u in _env_rpcs.split(",") if u.strip()] or _DEFAULT_RPCS
+BASE_RPC = RPC_ENDPOINTS[0]
 POSITION_MANAGER = "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd&include_24hr_change=true"
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDC"
@@ -134,10 +141,20 @@ def fetch_position(pid):
         tid = hex(int(pid))[2:].zfill(64)
         payload = json.dumps({"jsonrpc":"2.0","method":"eth_call",
             "params":[{"to":POSITION_MANAGER,"data":"0x99fbab88"+tid},"latest"],"id":1}).encode()
-        req = urllib.request.Request(BASE_RPC, data=payload,
-                headers={"Content-Type":"application/json","User-Agent":"LP-Daemon/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode())
+        result = None
+        last_err = None
+        for url in RPC_ENDPOINTS:
+            try:
+                req = urllib.request.Request(url, data=payload,
+                        headers={"Content-Type":"application/json","User-Agent":"LP-Daemon/1.0"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    result = json.loads(resp.read().decode())
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if result is None:
+            raise RuntimeError(f"all RPCs failed: {last_err}")
         if "result" in result and len(result["result"]) > 10:
             raw = result["result"][2:]
             if len(raw) >= 64*12:
@@ -158,18 +175,66 @@ def fetch_position(pid):
 # ============================================================
 # STRATEGY ENGINE (embedded, no GTK dependency)
 # ============================================================
+def _validate_strategy(cfg):
+    """Validate a strategy config dict. Returns list of error strings (empty = valid)."""
+    errors = []
+    if not isinstance(cfg, dict):
+        return ["strategy must be a JSON object"]
+    st = cfg.get("strategy_type")
+    if st not in ("exit_pool", "trend_following", "fixed"):
+        errors.append(f"strategy_type must be one of exit_pool|trend_following|fixed (got {st!r})")
+    params = cfg.get("parameters", {})
+    if not isinstance(params, dict):
+        errors.append("parameters must be an object"); params = {}
+    bw = params.get("base_width_pct", params.get("width_pct"))
+    if bw is not None:
+        try:
+            if not (1 <= float(bw) <= 100):
+                errors.append(f"base_width_pct/width_pct must be in [1,100] (got {bw})")
+        except (TypeError, ValueError):
+            errors.append(f"base_width_pct/width_pct must be numeric (got {bw!r})")
+    for key, lo, hi in (("buffer_pct",0,50),("trend_shift",0,2),("exit_trend_pct",0,50),("enter_trend_pct",0,50)):
+        v = params.get(key)
+        if v is None: continue
+        try:
+            if not (lo <= float(v) <= hi):
+                errors.append(f"{key} must be in [{lo},{hi}] (got {v})")
+        except (TypeError, ValueError):
+            errors.append(f"{key} must be numeric (got {v!r})")
+    ds = cfg.get("data_sources", {})
+    ind = ds.get("indicators", {}) if isinstance(ds, dict) else {}
+    for key in ("ema_fast","ema_slow","atr_period","rsi_period"):
+        v = ind.get(key)
+        if v is None: continue
+        if not (isinstance(v, int) and v > 0):
+            errors.append(f"indicators.{key} must be a positive integer (got {v!r})")
+    return errors
+
+
 class Strategy:
+    DEFAULT_CFG = {"strategy_type":"exit_pool",
+        "parameters":{"base_width_pct":15,"trend_shift":0.4,"buffer_pct":5,
+                      "exit_trend_pct":10,"enter_trend_pct":2}}
+
     def __init__(self, path):
         self.cfg = {}
         p = Path(path)
-        if p.exists():
-            with open(p) as f: self.cfg = json.load(f)
-            log(f"Strategy loaded: {self.cfg.get('name','?')}")
-        else:
+        if not p.exists():
             log(f"Strategy not found: {path}, using defaults", "WARN")
-            self.cfg = {"strategy_type":"exit_pool",
-                "parameters":{"base_width_pct":15,"trend_shift":0.4,"buffer_pct":5,
-                              "exit_trend_pct":10,"enter_trend_pct":2}}
+            self.cfg = dict(self.DEFAULT_CFG); return
+        try:
+            with open(p) as f: cfg = json.load(f)
+        except Exception as e:
+            log(f"Strategy parse error in {path}: {e}. Using defaults.", "ERROR")
+            self.cfg = dict(self.DEFAULT_CFG); return
+        errs = _validate_strategy(cfg)
+        if errs:
+            log(f"Invalid strategy in {path}:", "ERROR")
+            for e in errs: log(f"  - {e}", "ERROR")
+            log("Falling back to defaults.", "WARN")
+            self.cfg = dict(self.DEFAULT_CFG); return
+        self.cfg = cfg
+        log(f"Strategy loaded: {self.cfg.get('name','?')}")
 
     def evaluate(self, price, rlo, rhi, pool_active, hold_asset, price_history):
         p = self.cfg.get("parameters", {})

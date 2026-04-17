@@ -51,7 +51,16 @@ FEE_TO_TICK_SPACING = {100: 1, 500: 10, 3000: 60, 10000: 200}
 # ============================================================
 # CONSTANTS — Base Chain Uniswap V3
 # ============================================================
-BASE_RPC = "https://mainnet.base.org"
+# Base RPC endpoints, tried in order. Override via LP_RPC_ENDPOINTS
+# (comma-separated) to pin to private/paid providers.
+_DEFAULT_RPCS = [
+    "https://mainnet.base.org",
+    "https://base.publicnode.com",
+    "https://base.llamarpc.com",
+]
+_env_rpcs = os.environ.get("LP_RPC_ENDPOINTS", "")
+RPC_ENDPOINTS = [u.strip() for u in _env_rpcs.split(",") if u.strip()] or _DEFAULT_RPCS
+BASE_RPC = RPC_ENDPOINTS[0]  # Back-compat alias for direct rpc_call().
 CHAIN_ID = 8453
 
 # Uniswap V3 contracts on Base
@@ -239,16 +248,27 @@ def decrypt_key(password):
 # ============================================================
 import urllib.request
 
-def rpc_call(method, params):
-    """Make an RPC call to Base chain."""
+def rpc_call(method, params, endpoints=None):
+    """Make an RPC call, failing over across ``endpoints`` on error."""
+    urls = endpoints or RPC_ENDPOINTS
     payload = json.dumps({"jsonrpc":"2.0","method":method,"params":params,"id":1}).encode()
-    req = urllib.request.Request(BASE_RPC, data=payload,
-            headers={"Content-Type":"application/json","User-Agent":"LP-AutoBot/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read().decode())
-    if "error" in result:
-        raise Exception(f"RPC error: {result['error']}")
-    return result.get("result")
+    last_err = None
+    for url in urls:
+        try:
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type":"application/json","User-Agent":"LP-AutoBot/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode())
+            if "error" in result:
+                last_err = Exception(f"RPC error from {url}: {result['error']}")
+                continue
+            return result.get("result")
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"All RPC endpoints failed; last error: {last_err}")
 
 def get_nonce(address):
     r = rpc_call("eth_getTransactionCount", [address, "latest"])
@@ -339,8 +359,23 @@ class TxBuilder:
         try:
             from web3 import Web3
             from web3.middleware import ExtraDataToPOAMiddleware
-            self.w3 = Web3(Web3.HTTPProvider(BASE_RPC))
-            self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            # Try each RPC endpoint until one responds. This gives the bot
+            # a fighting chance when mainnet.base.org is having an outage.
+            last_err = None
+            self.w3 = None
+            for url in RPC_ENDPOINTS:
+                try:
+                    w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
+                    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                    if w3.is_connected():
+                        self.w3 = w3
+                        print(f"[AutoBot] RPC: {url}")
+                        break
+                except Exception as e:
+                    last_err = e
+                    continue
+            if self.w3 is None:
+                raise RuntimeError(f"All RPCs unreachable; last error: {last_err}")
             self.account = self.w3.eth.account.from_key(private_key)
             self.address = self.account.address
             self.slippage = slippage

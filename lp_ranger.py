@@ -62,7 +62,14 @@ HISTORY_FILE = DATA_DIR / "history.json"
 STATS_FILE = DATA_DIR / "stats.json"
 DEFAULT_STRAT = APP_DIR / "strategy_exit_pool.json"
 if not DEFAULT_STRAT.exists(): DEFAULT_STRAT = APP_DIR / "strategy_v1.json"
-BASE_RPC = "https://mainnet.base.org"
+_DEFAULT_RPCS = [
+    "https://mainnet.base.org",
+    "https://base.publicnode.com",
+    "https://base.llamarpc.com",
+]
+_env_rpcs = os.environ.get("LP_RPC_ENDPOINTS", "")
+RPC_ENDPOINTS = [u.strip() for u in _env_rpcs.split(",") if u.strip()] or _DEFAULT_RPCS
+BASE_RPC = RPC_ENDPOINTS[0]
 POSITION_MANAGER = "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"
 COINGECKO = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd&include_24hr_change=true"
 BINANCE = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDC"
@@ -149,8 +156,18 @@ class Fetcher:
         try:
             tid=hex(int(pid))[2:].zfill(64)
             pl=json.dumps({"jsonrpc":"2.0","method":"eth_call","params":[{"to":POSITION_MANAGER,"data":"0x99fbab88"+tid},"latest"],"id":1}).encode()
-            r=urllib.request.urlopen(urllib.request.Request(BASE_RPC,data=pl,headers={"Content-Type":"application/json","User-Agent":"LPR/4"}),timeout=15)
-            res=json.loads(r.read())
+            res = None
+            last_err = None
+            for url in RPC_ENDPOINTS:
+                try:
+                    r=urllib.request.urlopen(urllib.request.Request(url,data=pl,headers={"Content-Type":"application/json","User-Agent":"LPR/4"}),timeout=15)
+                    res=json.loads(r.read())
+                    break
+                except Exception as e:
+                    last_err = e
+                    continue
+            if res is None:
+                raise RuntimeError(f"all RPCs failed: {last_err}")
             if "result" in res and len(res["result"])>10:
                 raw=res["result"][2:];flds=[raw[i*64:(i+1)*64] for i in range(12)]
                 tl=int(flds[5],16);tu=int(flds[6],16)
@@ -163,13 +180,62 @@ class Fetcher:
             self.error="Posicion no encontrada";return False
         except Exception as e: self.error=str(e);return False
 
+def _validate_strategy(cfg):
+    """Validate a strategy config dict. Returns list of error strings (empty = valid)."""
+    errors = []
+    if not isinstance(cfg, dict):
+        return ["strategy must be a JSON object"]
+    st = cfg.get("strategy_type")
+    if st not in ("exit_pool", "trend_following", "fixed"):
+        errors.append(f"strategy_type must be one of exit_pool|trend_following|fixed (got {st!r})")
+    params = cfg.get("parameters", {})
+    if not isinstance(params, dict):
+        errors.append("parameters must be an object"); params = {}
+    bw = params.get("base_width_pct", params.get("width_pct"))
+    if bw is not None:
+        try:
+            if not (1 <= float(bw) <= 100):
+                errors.append(f"base_width_pct/width_pct must be in [1,100] (got {bw})")
+        except (TypeError, ValueError):
+            errors.append(f"base_width_pct/width_pct must be numeric (got {bw!r})")
+    for key, lo, hi in (("buffer_pct",0,50),("trend_shift",0,2),("exit_trend_pct",0,50),("enter_trend_pct",0,50)):
+        v = params.get(key)
+        if v is None: continue
+        try:
+            if not (lo <= float(v) <= hi):
+                errors.append(f"{key} must be in [{lo},{hi}] (got {v})")
+        except (TypeError, ValueError):
+            errors.append(f"{key} must be numeric (got {v!r})")
+    ds = cfg.get("data_sources", {})
+    ind = ds.get("indicators", {}) if isinstance(ds, dict) else {}
+    for key in ("ema_fast","ema_slow","atr_period","rsi_period"):
+        v = ind.get(key)
+        if v is None: continue
+        if not (isinstance(v, int) and v > 0):
+            errors.append(f"indicators.{key} must be a positive integer (got {v!r})")
+    return errors
+
 class Strat:
+    DEFAULT_CFG = {"name":"Default","strategy_type":"exit_pool","parameters":{"base_width_pct":15,"trend_shift":0.4,"buffer_pct":5,"exit_trend_pct":10,"enter_trend_pct":2}}
     def __init__(self,path=None):
         self.cfg={};self.prices=[];self.load(path or DEFAULT_STRAT)
     def load(self,p):
         p=Path(p)
-        if p.exists():self.cfg=json.load(open(p))
-        else:self.cfg={"name":"Default","strategy_type":"exit_pool","parameters":{"base_width_pct":15,"trend_shift":0.4,"buffer_pct":5,"exit_trend_pct":10,"enter_trend_pct":2}}
+        if not p.exists():
+            print(f"[Strat] WARN: strategy file not found: {p}. Using defaults.", file=sys.stderr)
+            self.cfg=dict(self.DEFAULT_CFG);return
+        try:
+            with open(p) as f: cfg=json.load(f)
+        except Exception as e:
+            print(f"[Strat] ERROR: failed to parse {p}: {e}. Using defaults.", file=sys.stderr)
+            self.cfg=dict(self.DEFAULT_CFG);return
+        errs=_validate_strategy(cfg)
+        if errs:
+            print(f"[Strat] ERROR: invalid strategy in {p}:", file=sys.stderr)
+            for e in errs: print(f"  - {e}", file=sys.stderr)
+            print(f"[Strat] Falling back to defaults.", file=sys.stderr)
+            self.cfg=dict(self.DEFAULT_CFG);return
+        self.cfg=cfg
     def add(self,p):self.prices.append((time.time(),p));self.prices=[(t,v) for t,v in self.prices if t>time.time()-60*86400]
     def _ema(self,per):
         ps=[p for _,p in self.prices]
