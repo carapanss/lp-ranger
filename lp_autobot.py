@@ -34,8 +34,19 @@ import math
 import hashlib
 import getpass
 import struct
+import threading
 from pathlib import Path
 from datetime import datetime
+
+# ------------------------------------------------------------
+# Safety knobs (conservative defaults — override via env vars).
+# ------------------------------------------------------------
+# Max acceptable adverse price move, fractional. E.g. 0.01 = 1%.
+DEFAULT_SLIPPAGE = float(os.environ.get("LP_SLIPPAGE", "0.01"))
+# Uniswap V3 absolute tick bounds.
+MIN_TICK, MAX_TICK = -887272, 887272
+# Pool fee tier → tick spacing.
+FEE_TO_TICK_SPACING = {100: 1, 500: 10, 3000: 60, 10000: 200}
 
 # ============================================================
 # CONSTANTS — Base Chain Uniswap V3
@@ -65,6 +76,17 @@ POSITION_MANAGER_ABI = json.loads('''[
 
 SWAP_ROUTER_ABI = json.loads('''[
   {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"amountOutMinimum","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct IV3SwapRouter.ExactInputSingleParams","name":"params","type":"tuple"}],"name":"exactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"payable","type":"function"}
+]''')
+
+FACTORY_ABI = json.loads('''[
+  {"inputs":[{"internalType":"address","name":"tokenA","type":"address"},{"internalType":"address","name":"tokenB","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"}],"name":"getPool","outputs":[{"internalType":"address","name":"pool","type":"address"}],"stateMutability":"view","type":"function"}
+]''')
+
+POOL_ABI = json.loads('''[
+  {"inputs":[],"name":"slot0","outputs":[{"internalType":"uint160","name":"sqrtPriceX96","type":"uint160"},{"internalType":"int24","name":"tick","type":"int24"},{"internalType":"uint16","name":"observationIndex","type":"uint16"},{"internalType":"uint16","name":"observationCardinality","type":"uint16"},{"internalType":"uint16","name":"observationCardinalityNext","type":"uint16"},{"internalType":"uint8","name":"feeProtocol","type":"uint8"},{"internalType":"bool","name":"unlocked","type":"bool"}],"stateMutability":"view","type":"function"},
+  {"inputs":[],"name":"token0","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+  {"inputs":[],"name":"token1","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+  {"inputs":[],"name":"tickSpacing","outputs":[{"internalType":"int24","name":"","type":"int24"}],"stateMutability":"view","type":"function"}
 ]''')
 
 # ============================================================
@@ -272,12 +294,34 @@ def get_position(token_id):
 
 def tick_to_price(tick):
     """Convert tick to USDC/ETH price (for WETH/USDC pool)."""
+    if not (MIN_TICK <= tick <= MAX_TICK):
+        raise ValueError(f"tick {tick} out of Uniswap V3 bounds")
     return 1.0001 ** tick * 1e12
 
+def _sqrt_ratio_at_tick(tick):
+    """Q64.96 sqrt price at a given tick (float approximation).
+
+    Matches Uniswap's TickMath within a handful of wei for the ranges we
+    use; precise enough to produce conservative ``amountMin`` bounds.
+    """
+    if not (MIN_TICK <= tick <= MAX_TICK):
+        raise ValueError(f"tick {tick} out of Uniswap V3 bounds")
+    return int((1.0001 ** (tick / 2)) * (2 ** 96))
+
 def price_to_tick(price, spacing=10):
-    """Convert USDC/ETH price to nearest valid tick."""
+    """Convert USDC/ETH price to nearest valid, spacing-aligned tick.
+
+    Always returns a tick that is both inside the protocol bounds
+    [MIN_TICK, MAX_TICK] and aligned to ``spacing``.
+    """
+    if price <= 0:
+        raise ValueError(f"price must be positive, got {price}")
     raw_tick = math.log(price / 1e12) / math.log(1.0001)
-    return round(raw_tick / spacing) * spacing
+    t = int(round(raw_tick / spacing)) * spacing
+    # Clamp to the largest spacing-aligned tick inside the protocol bounds.
+    max_aligned = (MAX_TICK // spacing) * spacing
+    min_aligned = -max_aligned
+    return max(min_aligned, min(max_aligned, t))
 
 
 # ============================================================
@@ -291,7 +335,7 @@ class TxBuilder:
     Install with: pip install web3
     """
     
-    def __init__(self, private_key):
+    def __init__(self, private_key, slippage=DEFAULT_SLIPPAGE):
         try:
             from web3 import Web3
             from web3.middleware import ExtraDataToPOAMiddleware
@@ -299,7 +343,8 @@ class TxBuilder:
             self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             self.account = self.w3.eth.account.from_key(private_key)
             self.address = self.account.address
-            
+            self.slippage = slippage
+
             self.pm = self.w3.eth.contract(
                 address=Web3.to_checksum_address(POSITION_MANAGER),
                 abi=POSITION_MANAGER_ABI
@@ -308,36 +353,108 @@ class TxBuilder:
                 address=Web3.to_checksum_address(SWAP_ROUTER),
                 abi=SWAP_ROUTER_ABI
             )
+            self.factory = self.w3.eth.contract(
+                address=Web3.to_checksum_address(FACTORY),
+                abi=FACTORY_ABI
+            )
             self.weth = self.w3.eth.contract(
                 address=Web3.to_checksum_address(WETH), abi=ERC20_ABI
             )
             self.usdc = self.w3.eth.contract(
                 address=Web3.to_checksum_address(USDC), abi=ERC20_ABI
             )
-            
+
             print(f"[AutoBot] Wallet: {self.address}")
             print(f"[AutoBot] Chain: Base (ID {CHAIN_ID})")
+            print(f"[AutoBot] Slippage tolerance: {self.slippage*100:.2f}%")
             self._nonce = None  # Will be fetched on first use
+            self._nonce_lock = threading.Lock()
+            self._pool_cache = {}  # fee -> pool address (checksummed)
         except ImportError:
             print("ERROR: web3 package required. Install with:")
             print("  pip install web3 --break-system-packages")
             sys.exit(1)
-    
+
     def _get_nonce(self):
-        """Get next nonce, tracking manually to avoid collisions."""
-        if self._nonce is None:
-            self._nonce = self.w3.eth.get_transaction_count(self.address)
-        n = self._nonce
-        self._nonce += 1
-        return n
-    
+        """Return next nonce, serialised via lock to avoid collisions."""
+        with self._nonce_lock:
+            if self._nonce is None:
+                self._nonce = self.w3.eth.get_transaction_count(self.address)
+            n = self._nonce
+            self._nonce += 1
+            return n
+
     def _reset_nonce(self):
-        """Reset nonce from chain (call after errors)."""
-        self._nonce = None
-    
+        """Reset nonce from chain (call after errors / stuck tx)."""
+        with self._nonce_lock:
+            self._nonce = None
+
     def _gas_price(self):
         """Get gas price with 10% buffer for faster confirmation."""
         return int(self.w3.eth.gas_price * 1.1)
+
+    def _pool_address(self, fee):
+        """Look up the WETH/USDC pool for a given fee tier."""
+        from web3 import Web3
+        cached = self._pool_cache.get(fee)
+        if cached:
+            return cached
+        addr = self.factory.functions.getPool(
+            Web3.to_checksum_address(WETH),
+            Web3.to_checksum_address(USDC),
+            fee,
+        ).call()
+        if int(addr, 16) == 0:
+            raise RuntimeError(f"No WETH/USDC pool for fee tier {fee}")
+        checksummed = Web3.to_checksum_address(addr)
+        self._pool_cache[fee] = checksummed
+        return checksummed
+
+    def _pool(self, fee):
+        """Return a web3 contract instance for the pool of ``fee`` tier."""
+        return self.w3.eth.contract(address=self._pool_address(fee), abi=POOL_ABI)
+
+    def _pool_token_order(self, fee):
+        """Return (token0, token1) as reported by the pool contract."""
+        pool = self._pool(fee)
+        return pool.functions.token0().call(), pool.functions.token1().call()
+
+    def get_pool_price_usdc_per_eth(self, fee=500):
+        """Current on-chain price from slot0, USDC per 1 ETH.
+
+        Uses only the pool contract so it cannot desync from the venue
+        we are about to trade against (no external oracle).
+        """
+        pool = self._pool(fee)
+        sqrt_price_x96, *_ = pool.functions.slot0().call()
+        # raw = (sqrtPrice / 2^96)^2 = price of token1/token0 in their smallest units
+        raw = (sqrt_price_x96 / (2 ** 96)) ** 2
+        # WETH=token0 (18 dec), USDC=token1 (6 dec) on Base → scale by 10^(18-6)
+        return raw * 1e12
+
+    def _send_and_wait(self, tx, label, timeout=180):
+        """Sign, send and require a SUCCESSFUL receipt.
+
+        Raises RuntimeError on failure (revert, timeout, status != 1) so
+        the caller never silently proceeds with an invalid state.
+        """
+        from web3.exceptions import TimeExhausted
+        try:
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        except TimeExhausted as e:
+            # Tx may still be in mempool — drop local nonce so the next
+            # action refreshes it from chain state.
+            self._reset_nonce()
+            raise RuntimeError(f"{label} timed out waiting for receipt: {e}") from e
+        if receipt.get("status", 0) != 1:
+            self._reset_nonce()
+            raise RuntimeError(
+                f"{label} reverted on-chain (tx: {tx_hash.hex()})"
+            )
+        print(f"  ✓ {label} (tx: {tx_hash.hex()[:16]}...)")
+        return tx_hash, receipt
     
     def check_gas(self, min_eth=0.0001):
         """Check if wallet has enough ETH for gas. Returns (ok, balance)."""
@@ -359,17 +476,22 @@ class TxBuilder:
             "USDC": usdc_bal / 1e6,
         }
     
-    def ensure_approval(self, token_contract, spender, amount):
-        """Approve token spending if needed."""
+    def ensure_approval(self, token_contract, spender, amount, buffer_mult=1.01):
+        """Approve exactly the required spend (plus a small safety buffer).
+
+        Avoids unlimited (2^256-1) approvals so a compromise of the
+        spender cannot drain future balances.
+        """
         from web3 import Web3
-        current = token_contract.functions.allowance(
-            self.address, Web3.to_checksum_address(spender)
-        ).call()
-        if current < amount:
-            print(f"  Approving token for {spender[:10]}...")
-            tx = token_contract.functions.approve(
-                Web3.to_checksum_address(spender),
-                2**256 - 1  # Max approval
+        spender_cs = Web3.to_checksum_address(spender)
+        current = token_contract.functions.allowance(self.address, spender_cs).call()
+        if current >= amount:
+            return None
+        target = int(amount * buffer_mult)
+        # Some ERC20s (notably USDT) require resetting allowance to 0 first.
+        if current != 0:
+            reset_tx = token_contract.functions.approve(
+                spender_cs, 0
             ).build_transaction({
                 'from': self.address,
                 'nonce': self._get_nonce(),
@@ -377,31 +499,71 @@ class TxBuilder:
                 'gasPrice': self._gas_price(),
                 'chainId': CHAIN_ID,
             })
-            signed = self.account.sign_transaction(tx)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            print(f"  ✓ Approved (tx: {tx_hash.hex()[:16]}...)")
-            return receipt
-        return None
-    
-    def close_position(self, token_id, max_slippage_pct=2.0):
-        """Close an existing position: decrease liquidity + collect all."""
+            self._send_and_wait(reset_tx, "reset allowance")
+        print(f"  Approving {target} for {spender_cs[:10]}...")
+        tx = token_contract.functions.approve(
+            spender_cs, target
+        ).build_transaction({
+            'from': self.address,
+            'nonce': self._get_nonce(),
+            'gas': 100000,
+            'gasPrice': self._gas_price(),
+            'chainId': CHAIN_ID,
+        })
+        _, receipt = self._send_and_wait(tx, "approve")
+        return receipt
+
+    def revoke_approval(self, token_contract, spender):
+        """Set allowance back to 0. Best-effort — failures are logged not raised."""
         from web3 import Web3
-        
+        spender_cs = Web3.to_checksum_address(spender)
+        try:
+            current = token_contract.functions.allowance(self.address, spender_cs).call()
+            if current == 0:
+                return
+            tx = token_contract.functions.approve(
+                spender_cs, 0
+            ).build_transaction({
+                'from': self.address,
+                'nonce': self._get_nonce(),
+                'gas': 100000,
+                'gasPrice': self._gas_price(),
+                'chainId': CHAIN_ID,
+            })
+            self._send_and_wait(tx, "revoke approval")
+        except Exception as e:
+            print(f"  ⚠️  revoke_approval failed (non-fatal): {e}")
+    
+    def close_position(self, token_id):
+        """Close an existing position: decrease liquidity + collect all.
+
+        Applies the configured slippage tolerance to the minimum-output
+        amounts on ``decreaseLiquidity`` so a mid-tx price move cannot
+        rug the withdrawal.
+        """
         pos = get_position(token_id)
         if not pos or pos["liquidity"] == 0:
             print(f"  Position {token_id} has no liquidity")
             return None
-        
+
         print(f"  Closing position {token_id} (liq: {pos['liquidity']})")
         deadline = int(time.time()) + 600  # 10 min
-        
-        # Step 1: Decrease liquidity to 0
+
+        # Estimate expected amounts at the current price to derive min outs.
+        try:
+            exp0, exp1 = self._estimate_burn_amounts(pos)
+            min0 = max(0, int(exp0 * (1 - self.slippage)))
+            min1 = max(0, int(exp1 * (1 - self.slippage)))
+        except Exception as e:
+            # Fallback: accept any — less safe but preserves forward-compat.
+            print(f"  ⚠️  could not estimate burn amounts ({e}); skipping min bounds")
+            min0, min1 = 0, 0
+
         gas_price = self._gas_price()
         tx1 = self.pm.functions.decreaseLiquidity((
             token_id,
             pos["liquidity"],
-            0, 0, deadline,
+            min0, min1, deadline,
         )).build_transaction({
             'from': self.address,
             'nonce': self._get_nonce(),
@@ -410,12 +572,9 @@ class TxBuilder:
             'chainId': CHAIN_ID,
             'value': 0,
         })
-        signed1 = self.account.sign_transaction(tx1)
-        tx_hash1 = self.w3.eth.send_raw_transaction(signed1.raw_transaction)
-        receipt1 = self.w3.eth.wait_for_transaction_receipt(tx_hash1, timeout=120)
-        print(f"  ✓ Liquidity removed (tx: {tx_hash1.hex()[:16]}...)")
-        
-        # Step 2: Collect all tokens (nonce auto-incremented)
+        tx_hash1, _ = self._send_and_wait(tx1, "liquidity removed")
+
+        # Step 2: Collect all tokens.
         MAX_UINT128 = 2**128 - 1
         tx2 = self.pm.functions.collect((
             token_id,
@@ -430,23 +589,66 @@ class TxBuilder:
             'chainId': CHAIN_ID,
             'value': 0,
         })
-        signed2 = self.account.sign_transaction(tx2)
-        tx_hash2 = self.w3.eth.send_raw_transaction(signed2.raw_transaction)
-        receipt2 = self.w3.eth.wait_for_transaction_receipt(tx_hash2, timeout=120)
-        print(f"  ✓ Tokens collected (tx: {tx_hash2.hex()[:16]}...)")
-        
+        tx_hash2, _ = self._send_and_wait(tx2, "tokens collected")
+
         return {"decrease_tx": tx_hash1.hex(), "collect_tx": tx_hash2.hex()}
+
+    def _estimate_burn_amounts(self, pos, fee=500):
+        """Estimate token amounts returned by decreaseLiquidity at current price.
+
+        Uses the standard Uniswap V3 concentrated-liquidity formulae from
+        the whitepaper, operating on sqrtPriceX96 to stay exact.
+        """
+        pool = self._pool(fee)
+        sqrt_p, _tick, *_ = pool.functions.slot0().call()
+        L = int(pos["liquidity"])
+        sqrt_a = int(_sqrt_ratio_at_tick(pos["tickLower"]))
+        sqrt_b = int(_sqrt_ratio_at_tick(pos["tickUpper"]))
+        if sqrt_a > sqrt_b:
+            sqrt_a, sqrt_b = sqrt_b, sqrt_a
+        Q96 = 2 ** 96
+        if sqrt_p <= sqrt_a:
+            amount0 = L * (sqrt_b - sqrt_a) * Q96 // (sqrt_b * sqrt_a)
+            amount1 = 0
+        elif sqrt_p < sqrt_b:
+            amount0 = L * (sqrt_b - sqrt_p) * Q96 // (sqrt_b * sqrt_p)
+            amount1 = L * (sqrt_p - sqrt_a) // Q96
+        else:
+            amount0 = 0
+            amount1 = L * (sqrt_b - sqrt_a) // Q96
+        return amount0, amount1
     
-    def swap_exact_input(self, token_in, token_out, amount_in, fee=500, max_slippage_pct=2.0):
-        """Swap tokens using SwapRouter02."""
+    def swap_exact_input(self, token_in, token_out, amount_in, fee=500, slippage=None):
+        """Swap tokens using SwapRouter02 with MEV-aware slippage.
+
+        Computes the minimum accepted output from the on-chain pool price
+        (``slot0``), the pool fee, and the configured slippage tolerance.
+        Refuses to swap if ``amount_in`` is non-positive.
+        """
         from web3 import Web3
-        
-        amount_out_min = 0  # Will be calculated with slippage
-        
-        # Ensure approval
+
+        if amount_in <= 0:
+            print("  ⚠️  swap_exact_input called with amount_in<=0, skipping")
+            return None
+
+        slip = self.slippage if slippage is None else slippage
+
+        # Derive expected output from pool price (no external oracle).
+        pool_price = self.get_pool_price_usdc_per_eth(fee)  # USDC per 1 ETH
+        fee_mult = 1 - fee / 1_000_000  # e.g. 0.05% fee tier → 0.9995
+        if token_in.lower() == WETH.lower():
+            # ETH-in (18 dec) → USDC-out (6 dec)
+            expected_out_units = (amount_in / 1e18) * pool_price
+            amount_out_min = int(expected_out_units * 1e6 * fee_mult * (1 - slip))
+        else:
+            # USDC-in (6 dec) → ETH-out (18 dec)
+            expected_out_units = (amount_in / 1e6) / pool_price
+            amount_out_min = int(expected_out_units * 1e18 * fee_mult * (1 - slip))
+
+        # Approve only the amount we are about to spend.
         token_contract = self.weth if token_in.lower() == WETH.lower() else self.usdc
         self.ensure_approval(token_contract, SWAP_ROUTER, amount_in)
-        
+
         tx = self.router.functions.exactInputSingle((
             Web3.to_checksum_address(token_in),
             Web3.to_checksum_address(token_out),
@@ -454,7 +656,7 @@ class TxBuilder:
             self.address,
             amount_in,
             amount_out_min,
-            0,  # sqrtPriceLimitX96 = 0 (no limit)
+            0,  # sqrtPriceLimitX96 = 0 (no limit — min-out handles MEV)
         )).build_transaction({
             'from': self.address,
             'nonce': self._get_nonce(),
@@ -463,37 +665,74 @@ class TxBuilder:
             'chainId': CHAIN_ID,
             'value': 0,
         })
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-        print(f"  ✓ Swap executed (tx: {tx_hash.hex()[:16]}...)")
+        tx_hash, receipt = self._send_and_wait(tx, "swap executed")
+        # Revoke remaining allowance after the swap as a precaution.
+        try:
+            self.revoke_approval(token_contract, SWAP_ROUTER)
+        except Exception:
+            pass
         return {"tx": tx_hash.hex(), "receipt": receipt}
     
     def open_position(self, tick_lower, tick_upper, amount0, amount1, fee=500):
-        """Open a new position with given tick range."""
+        """Open a new position with given tick range.
+
+        Validates tick bounds / alignment, reads token order from the pool
+        contract (instead of trusting a local hex compare), and sets
+        ``amount0Min / amount1Min`` from slippage.
+        """
         from web3 import Web3
-        
-        # Ensure approvals
-        self.ensure_approval(self.weth, POSITION_MANAGER, amount0)
-        self.ensure_approval(self.usdc, POSITION_MANAGER, amount1)
-        
+
+        # Validate tick spacing + bounds against the live pool.
+        pool = self._pool(fee)
+        spacing = pool.functions.tickSpacing().call()
+        if tick_lower >= tick_upper:
+            raise ValueError(f"tick_lower {tick_lower} >= tick_upper {tick_upper}")
+        if tick_lower < MIN_TICK or tick_upper > MAX_TICK:
+            raise ValueError("tick range out of protocol bounds")
+        if tick_lower % spacing or tick_upper % spacing:
+            raise ValueError(
+                f"ticks not aligned to pool spacing {spacing}: "
+                f"lower={tick_lower}, upper={tick_upper}"
+            )
+
+        # Read the actual token order from the pool rather than assuming.
+        pool_t0, pool_t1 = self._pool_token_order(fee)
+        weth_cs = Web3.to_checksum_address(WETH)
+        usdc_cs = Web3.to_checksum_address(USDC)
+        if {pool_t0.lower(), pool_t1.lower()} != {weth_cs.lower(), usdc_cs.lower()}:
+            raise RuntimeError(
+                f"pool token mismatch: got {pool_t0}/{pool_t1}, expected WETH/USDC"
+            )
+        # Map caller-provided amounts (WETH=amount0, USDC=amount1) onto the
+        # pool's token0/token1 order.
+        if pool_t0.lower() == weth_cs.lower():
+            a0, a1 = amount0, amount1
+        else:
+            a0, a1 = amount1, amount0
+
+        # Approve the exact amounts we intend to spend, no more.
+        if a0 > 0:
+            self.ensure_approval(
+                self.w3.eth.contract(address=Web3.to_checksum_address(pool_t0), abi=ERC20_ABI),
+                POSITION_MANAGER, a0,
+            )
+        if a1 > 0:
+            self.ensure_approval(
+                self.w3.eth.contract(address=Web3.to_checksum_address(pool_t1), abi=ERC20_ABI),
+                POSITION_MANAGER, a1,
+            )
+
+        # Slippage-protected min amounts.
+        a0_min = int(a0 * (1 - self.slippage)) if a0 > 0 else 0
+        a1_min = int(a1 * (1 - self.slippage)) if a1 > 0 else 0
+
         deadline = int(time.time()) + 600
-        
-        # Ensure token0 < token1 (WETH < USDC on Base)
-        t0 = Web3.to_checksum_address(WETH)
-        t1 = Web3.to_checksum_address(USDC)
-        a0 = amount0
-        a1 = amount1
-        
-        if int(t0, 16) > int(t1, 16):
-            t0, t1 = t1, t0
-            a0, a1 = a1, a0
-        
+
         tx = self.pm.functions.mint((
-            t0, t1, fee,
+            pool_t0, pool_t1, fee,
             tick_lower, tick_upper,
             a0, a1,
-            0, 0,  # min amounts (accept any)
+            a0_min, a1_min,
             self.address,
             deadline,
         )).build_transaction({
@@ -504,10 +743,8 @@ class TxBuilder:
             'chainId': CHAIN_ID,
             'value': 0,
         })
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-        
+        tx_hash, receipt = self._send_and_wait(tx, "position opened", timeout=240)
+
         # Extract tokenId from logs
         new_token_id = None
         for log in receipt.get('logs', []):
@@ -515,8 +752,16 @@ class TxBuilder:
                 # Transfer event: topic[3] is tokenId
                 new_token_id = int(log['topics'][3].hex(), 16)
                 break
-        
-        print(f"  ✓ Position opened (tx: {tx_hash.hex()[:16]}..., tokenId: {new_token_id})")
+
+        # Revoke leftover allowances to the PositionManager.
+        for tok in (pool_t0, pool_t1):
+            try:
+                tc = self.w3.eth.contract(address=Web3.to_checksum_address(tok), abi=ERC20_ABI)
+                self.revoke_approval(tc, POSITION_MANAGER)
+            except Exception:
+                pass
+
+        print(f"  tokenId: {new_token_id}")
         return {"tx": tx_hash.hex(), "token_id": new_token_id}
     
     def rebalance(self, old_token_id, new_tick_lower, new_tick_upper, fee=500, dry_run=False, auto_confirm=False):
@@ -565,24 +810,29 @@ class TxBuilder:
             results["close"] = self.close_position(old_token_id)
             time.sleep(2)  # Wait for state to update
         
-        # Step 2: Check balances and swap if needed
+        # Step 2: Check balances and swap if needed. Uses the live pool price
+        # (not tick_to_price(0) which is WETH-USDC at tick 0 ≈ $1) to compute
+        # the USD-value ratio we need.
         print(f"\n  [2/3] Rebalancing tokens...")
         balances = self.get_balances()
         weth_val = balances["WETH"]
         usdc_val = balances["USDC"]
-        total_usd = weth_val * tick_to_price(0) + usdc_val  # Rough estimate
-        
-        # For concentrated liquidity, we need roughly 50/50 in value
-        # This is a simplification; exact ratio depends on current price vs range
-        target_weth_val = total_usd * 0.5 / tick_to_price(0) if tick_to_price(0) > 0 else 0
-        
-        if weth_val > target_weth_val * 1.1:
+        pool_price = self.get_pool_price_usdc_per_eth(fee)  # USDC per 1 ETH
+        total_usd = weth_val * pool_price + usdc_val
+        print(f"  Pool price: ${pool_price:,.2f} USDC/ETH — total ${total_usd:,.2f}")
+
+        # Rough 50/50 USD split. For out-of-range positions you would
+        # want a skewed ratio; this is left as a follow-up (the pool will
+        # consume whatever it needs — our slippage bounds cap the risk).
+        target_weth_val = total_usd * 0.5 / pool_price
+
+        if weth_val > target_weth_val * 1.05:
             # Too much WETH, swap some to USDC
             swap_amount = int((weth_val - target_weth_val) * 1e18)
             if swap_amount > 0:
                 print(f"  Swapping {swap_amount/1e18:.6f} WETH → USDC...")
                 results["swap"] = self.swap_exact_input(WETH, USDC, swap_amount, fee)
-        elif usdc_val > total_usd * 0.6:
+        elif usdc_val > (total_usd * 0.5) * 1.05:
             # Too much USDC, swap some to WETH
             swap_amount = int((usdc_val - total_usd * 0.5) * 1e6)
             if swap_amount > 0:
