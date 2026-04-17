@@ -116,8 +116,10 @@ class Hist:
     def recent(self,n=20): return self.h[-n:]
 
 class Stats:
+    DEFAULT_POSITION_USD = 119.50
     def __init__(self):
-        self.d={"total_fees":0,"fees_today":0,"fees_today_date":"","total_il":0,"il_segments":[],"pool_active":True,"hold_asset":None}
+        self.d={"total_fees":0,"fees_today":0,"fees_today_date":"","total_il":0,"il_segments":[],
+                "pool_active":True,"hold_asset":None,"position_usd":self.DEFAULT_POSITION_USD}
         loaded = _load_json(STATS_FILE, {})
         if isinstance(loaded, dict):
             self.d.update(loaded)
@@ -128,29 +130,70 @@ class Stats:
         td=datetime.now().strftime("%Y-%m-%d")
         if self.d["fees_today_date"]!=td: self.d["fees_today"]=0; self.d["fees_today_date"]=td
         self.d["fees_today"]+=a; self.d["total_fees"]+=a; self.save()
+    def _position_value(self):
+        """Current estimated USD value of the position (deposit + fees − IL)."""
+        return max(self.d.get("position_usd", self.DEFAULT_POSITION_USD)
+                   + self.d.get("total_fees", 0)
+                   - self.d.get("total_il", 0),
+                   1.0)
     def record_il(self,olo,ohi,nlo,nhi,p):
-        il=0
-        if olo>0 and ohi>0:
-            e=(olo+ohi)/2;r=p/e if e>0 else 1;sq=math.sqrt(abs(r)) if r>0 else 1
-            s=abs(2*sq/(1+r)-1);w=(ohi-olo)/e*100 if e>0 else 15
-            c=min(s*math.sqrt(100/max(w,5)),0.10);il=119.50*c
-            self.d["total_il"]+=il; self.d["il_segments"].append({"date":datetime.now().isoformat()[:16],
-            "old":f"${olo:.0f}-${ohi:.0f}","new":f"${nlo:.0f}-${nhi:.0f}" if nlo else "cerrada",
-            "price":round(p,0),"il_pct":round(c*100,2),"il_usd":round(il,2)})
-            self.d["il_segments"]=self.d["il_segments"][-100:]
-        self.save(); return il
+        """Record IL for a rebalance/exit. Uses standard V2 IL formula scaled
+        by current position value, with a V3 concentration amplifier bounded
+        to avoid runaway estimates for narrow ranges near an edge."""
+        if olo<=0 or ohi<=0 or p<=0:
+            self.save(); return 0
+        entry=(olo+ohi)/2
+        if entry<=0:
+            self.save(); return 0
+        r=p/entry
+        # Standard V2 IL: 2*sqrt(r)/(1+r) - 1 (always ≤ 0)
+        il_v2=abs(2*math.sqrt(r)/(1+r)-1) if r>0 else 0
+        # V3 concentration amplifier, capped (narrow ranges amplify IL)
+        width_pct=(ohi-olo)/entry*100
+        amp=min(math.sqrt(100/max(width_pct,5)), 4.0)
+        il_pct=min(il_v2*amp, 0.20)  # cap at 20% per rebalance
+        il_usd=il_pct*self._position_value()
+        self.d["total_il"]+=il_usd
+        self.d["il_segments"].append({
+            "date":datetime.now().isoformat()[:16],
+            "old":f"${olo:.0f}-${ohi:.0f}",
+            "new":f"${nlo:.0f}-${nhi:.0f}" if nlo else "cerrada",
+            "price":round(p,0),"il_pct":round(il_pct*100,2),"il_usd":round(il_usd,2)})
+        self.d["il_segments"]=self.d["il_segments"][-100:]
+        self.save(); return il_usd
 
 class Fetcher:
     def __init__(self): self.price=0;self.change=0;self.pos=None;self.error=None
+    @staticmethod
+    def _try_coingecko():
+        r=urllib.request.urlopen(urllib.request.Request(COINGECKO,headers={"Accept":"application/json","User-Agent":"LPR/4"}),timeout=10)
+        d=json.loads(r.read())
+        return (float(d["ethereum"]["usd"]), float(d["ethereum"].get("usd_24h_change",0) or 0))
+    @staticmethod
+    def _try_binance():
+        r=urllib.request.urlopen(urllib.request.Request(BINANCE,headers={"User-Agent":"LPR/4"}),timeout=10)
+        d=json.loads(r.read())
+        return (float(d["lastPrice"]), float(d["priceChangePercent"]))
     def fetch_price(self):
-        try:
-            r=urllib.request.urlopen(urllib.request.Request(COINGECKO,headers={"Accept":"application/json","User-Agent":"LPR/4"}),timeout=10)
-            d=json.loads(r.read());self.price=d["ethereum"]["usd"];self.change=d["ethereum"].get("usd_24h_change",0);self.error=None;return True
-        except:
-            try:
-                r=urllib.request.urlopen(urllib.request.Request(BINANCE,headers={"User-Agent":"LPR/4"}),timeout=10)
-                d=json.loads(r.read());self.price=float(d["lastPrice"]);self.change=float(d["priceChangePercent"]);self.error=None;return True
-            except Exception as e: self.error=str(e);return False
+        """Race CoinGecko and Binance in parallel; use whichever returns first."""
+        results={}
+        def worker(name, fn):
+            try: results[name]=fn()
+            except Exception as e: results[name]=e
+        threads=[threading.Thread(target=worker,args=("cg",self._try_coingecko),daemon=True),
+                 threading.Thread(target=worker,args=("bn",self._try_binance),daemon=True)]
+        for t in threads: t.start()
+        deadline=time.time()+10
+        while time.time()<deadline:
+            for name in ("cg","bn"):
+                v=results.get(name)
+                if isinstance(v, tuple):
+                    self.price,self.change=v;self.error=None;return True
+            if len(results)==2: break
+            time.sleep(0.05)
+        errs=[f"{k}:{v}" for k,v in results.items() if isinstance(v,Exception)]
+        self.error=" / ".join(errs) or "price fetch timeout"
+        return False
     def fetch_position(self,pid):
         if not pid: self.error="No ID";return False
         try:
@@ -237,45 +280,64 @@ class Strat:
             self.cfg=dict(self.DEFAULT_CFG);return
         self.cfg=cfg
     def add(self,p):self.prices.append((time.time(),p));self.prices=[(t,v) for t,v in self.prices if t>time.time()-60*86400]
+    def _prices(self): return [p for _,p in self.prices]
+    def _warm(self, ic):
+        """Have we seen enough data for all requested indicators to be meaningful?"""
+        need = max(int(ic.get("ema_slow",50)), int(ic.get("rsi_period",14))+1, int(ic.get("atr_period",14))+1)
+        return len(self.prices) >= need
     def _ema(self,per):
-        ps=[p for _,p in self.prices]
-        if len(ps)<2:return ps[-1] if ps else 0
-        k=2/(per+1);e=ps[0]
-        for p in ps[1:]:e=p*k+e*(1-k)
+        ps=self._prices()
+        if len(ps)<per: return None
+        k=2/(per+1); e=sum(ps[:per])/per
+        for p in ps[per:]: e=p*k+e*(1-k)
         return e
     def _atr(self,per=14):
-        ps=[p for _,p in self.prices]
-        if len(ps)<2:return 0
-        ts=[abs(ps[i]-ps[i-1]) for i in range(1,len(ps))];k=2/(per+1);a=ts[0]
-        for t in ts[1:]:a=t*k+a*(1-k)
+        ps=self._prices()
+        if len(ps)<per+1: return None
+        ts=[abs(ps[i]-ps[i-1]) for i in range(1,len(ps))]
+        a=sum(ts[:per])/per
+        for t in ts[per:]: a=(a*(per-1)+t)/per
         return a
     def _rsi(self,per=14):
-        ps=[p for _,p in self.prices]
-        if len(ps)<per+1:return 50
-        ds=[ps[i]-ps[i-1] for i in range(1,len(ps))];g=[max(d,0) for d in ds];l=[max(-d,0) for d in ds]
-        k=2/(per+1);ag=g[0];al=l[0]
-        for i in range(1,len(g)):ag=g[i]*k+ag*(1-k);al=l[i]*k+al*(1-k)
-        if al==0:return 100
+        ps=self._prices()
+        if len(ps)<per+1: return None
+        ds=[ps[i]-ps[i-1] for i in range(1,len(ps))]
+        gs=[max(d,0) for d in ds]; ls=[max(-d,0) for d in ds]
+        ag=sum(gs[:per])/per; al=sum(ls[:per])/per
+        for i in range(per,len(ds)):
+            ag=(ag*(per-1)+gs[i])/per; al=(al*(per-1)+ls[i])/per
+        if al==0: return 100 if ag>0 else 50
         return 100-(100/(1+ag/al))
     def evaluate(self,price,rlo,rhi,pool_active=True,hold=None):
         if price<=0:return "gray",None,{"message":"Esperando datos..."}
         p=self.cfg.get("parameters",{});ic=self.cfg.get("data_sources",{}).get("indicators",{})
         st=self.cfg.get("strategy_type","exit_pool")
+        warm=self._warm(ic)
         ef=self._ema(ic.get("ema_fast",20));es=self._ema(ic.get("ema_slow",50))
         atr=self._atr(ic.get("atr_period",14));rsi=self._rsi(ic.get("rsi_period",14))
-        vp=atr/price*100 if price>0 else 0;tu=ef>es;tp=(ef-es)/es*100 if es>0 else 0
-        det={"in_range":False,"price":round(price,2),"ema_fast":round(ef,2),"ema_slow":round(es,2),
-             "trend":"alcista" if tu else "bajista","trend_pct":round(tp,1),"volatility_pct":round(vp,2),
-             "rsi":round(rsi,1),"atr":round(atr,2),"dist_lo_pct":0,"dist_hi_pct":0,"edge_dist_pct":0}
+        vp=(atr/price*100) if (atr is not None and price>0) else 0
+        tu=(ef is not None and es is not None and ef>es)
+        tp=((ef-es)/es*100) if (ef is not None and es is not None and es>0) else 0
+        det={"in_range":False,"price":round(price,2),
+             "ema_fast":round(ef,2) if ef is not None else None,
+             "ema_slow":round(es,2) if es is not None else None,
+             "trend":("alcista" if tu else "bajista") if (ef is not None and es is not None) else "desconocida",
+             "trend_pct":round(tp,1),"volatility_pct":round(vp,2),
+             "rsi":round(rsi,1) if rsi is not None else None,
+             "atr":round(atr,2) if atr is not None else None,
+             "dist_lo_pct":0,"dist_hi_pct":0,"edge_dist_pct":0,"warming_up":not warm}
+        if not warm:
+            det["message"]=f"Calentando indicadores ({len(self.prices)} muestras)."
+            return "gray",None,det
         if not pool_active:
             h=hold or "USDC";det["message"]=f"Pool cerrada. Holding {h}."
             nt=p.get("enter_trend_pct",2)
-            if abs(tp)<nt and len(self.prices)>30:
+            if abs(tp)<nt:
                 bw=p.get("base_width_pct",15);hw=bw/200;ts2=p.get("trend_shift",0.4)
                 sh=hw*ts2*min(abs(tp)/100*8,1);nc=price*(1+sh) if tu else price*(1-sh)
                 return f"closed_{h.lower()}",{"type":"enter_pool","lo":round(nc*(1-bw/200),2),"hi":round(nc*(1+bw/200),2),"width_pct":bw,"reason":f"Lateralizacion ({tp:+.1f}%). Re-entrar."},det
-            if h=="ETH" and rsi<35:bw=p.get("base_width_pct",15);return f"closed_eth",{"type":"enter_pool","lo":round(price*(1-bw/200),2),"hi":round(price*(1+bw/200),2),"width_pct":bw,"reason":f"RSI {rsi:.0f}"},det
-            if h=="USDC" and rsi>65:bw=p.get("base_width_pct",15);return f"closed_usdc",{"type":"enter_pool","lo":round(price*(1-bw/200),2),"hi":round(price*(1+bw/200),2),"width_pct":bw,"reason":f"RSI {rsi:.0f}"},det
+            if h=="ETH" and rsi is not None and rsi<35:bw=p.get("base_width_pct",15);return f"closed_eth",{"type":"enter_pool","lo":round(price*(1-bw/200),2),"hi":round(price*(1+bw/200),2),"width_pct":bw,"reason":f"RSI {rsi:.0f}"},det
+            if h=="USDC" and rsi is not None and rsi>65:bw=p.get("base_width_pct",15);return f"closed_usdc",{"type":"enter_pool","lo":round(price*(1-bw/200),2),"hi":round(price*(1+bw/200),2),"width_pct":bw,"reason":f"RSI {rsi:.0f}"},det
             return f"closed_{h.lower()}",None,det
         if rlo<=0 or rhi<=0:det["message"]="Configura tu posicion.";return "gray",None,det
         inr=rlo<=price<=rhi;det["in_range"]=inr;rw=rhi-rlo
@@ -285,7 +347,7 @@ class Strat:
         else:
             det["dist_lo_pct"]=round((price-rlo)/price*100,1) if price>0 else 0
             det["dist_hi_pct"]=round((rhi-price)/price*100,1) if price>0 else 0
-        if st=="exit_pool" and abs(tp)>p.get("exit_trend_pct",10) and len(self.prices)>30:
+        if st=="exit_pool" and abs(tp)>p.get("exit_trend_pct",10):
             h="ETH" if tp>0 else "USDC";r=f"Tendencia fuerte ({tp:+.1f}%). Cerrar pool, hold {h}."
             det["message"]=r;return f"exit_{h.lower()}",{"type":"exit_pool","hold":h,"reason":r},det
         buf=p.get("buffer_pct",5)/100

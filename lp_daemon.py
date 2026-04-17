@@ -242,20 +242,23 @@ class Strategy:
         ic = self.cfg.get("data_sources",{}).get("indicators",{})
 
         prices = [x["p"] for x in price_history]
-        if len(prices) < 2:
-            return "gray", None, {"message": "Insufficient data"}
+        need = max(int(ic.get("ema_slow",50)), int(ic.get("rsi_period",14))+1, int(ic.get("atr_period",14))+1)
+        if len(prices) < need:
+            return "gray", None, {"message": f"Warming up ({len(prices)}/{need} samples)", "warming_up": True}
 
         ef = self._ema(prices, ic.get("ema_fast",20))
         es = self._ema(prices, ic.get("ema_slow",50))
         atr = self._atr(prices, ic.get("atr_period",14))
         rsi = self._rsi(prices, ic.get("rsi_period",14))
-        vp = atr/price*100 if price>0 else 0
-        tu = ef > es
-        tp = (ef-es)/es*100 if es>0 else 0
+        vp = (atr/price*100) if (atr is not None and price>0) else 0
+        tu = (ef is not None and es is not None and ef > es)
+        tp = ((ef-es)/es*100) if (ef is not None and es is not None and es>0) else 0
 
         det = {"price":price,"trend":"up" if tu else "down","trend_pct":round(tp,1),
-               "ema_fast":round(ef,2),"ema_slow":round(es,2),
-               "rsi":round(rsi,1),"vol":round(vp,2),"atr":round(atr,2)}
+               "ema_fast":round(ef,2) if ef is not None else None,
+               "ema_slow":round(es,2) if es is not None else None,
+               "rsi":round(rsi,1) if rsi is not None else None,
+               "vol":round(vp,2),"atr":round(atr,2) if atr is not None else None}
 
         # Pool closed → check for re-entry
         if not pool_active:
@@ -269,12 +272,12 @@ class Strategy:
                     "hi":round(nc*(1+bw/200),2),"width":bw,
                     "reason":f"Lateralización (trend {tp:+.1f}%)"}, det
             h = hold_asset or "USDC"
-            if h=="ETH" and rsi<35:
+            if h=="ETH" and rsi is not None and rsi<35:
                 bw=p.get("base_width_pct",15)
                 return "enter",{"type":"enter_pool","lo":round(price*(1-bw/200),2),
                     "hi":round(price*(1+bw/200),2),"width":bw,
                     "reason":f"RSI {rsi:.0f}, reversión posible"},det
-            if h=="USDC" and rsi>65:
+            if h=="USDC" and rsi is not None and rsi>65:
                 bw=p.get("base_width_pct",15)
                 return "enter",{"type":"enter_pool","lo":round(price*(1-bw/200),2),
                     "hi":round(price*(1+bw/200),2),"width":bw,
@@ -288,7 +291,7 @@ class Strategy:
         inr = rlo <= price <= rhi
 
         # Exit pool signal
-        if st == "exit_pool" and abs(tp) > p.get("exit_trend_pct",10) and len(prices)>30:
+        if st == "exit_pool" and abs(tp) > p.get("exit_trend_pct",10):
             h = "ETH" if tp > 0 else "USDC"
             return "exit", {"type":"exit_pool","hold":h,
                 "reason":f"Tendencia fuerte ({tp:+.1f}%), exit → {h}"}, det
@@ -315,23 +318,24 @@ class Strategy:
         return "green", None, det
 
     def _ema(self, prices, per):
-        if not prices: return 0
-        k=2/(per+1); e=prices[0]
-        for p in prices[1:]: e=p*k+e*(1-k)
+        if len(prices) < per: return None
+        k=2/(per+1); e=sum(prices[:per])/per
+        for p in prices[per:]: e=p*k+e*(1-k)
         return e
     def _atr(self, prices, per):
-        if len(prices)<2: return 0
+        if len(prices) < per+1: return None
         trs=[abs(prices[i]-prices[i-1]) for i in range(1,len(prices))]
-        k=2/(per+1); a=trs[0]
-        for t in trs[1:]: a=t*k+a*(1-k)
+        a=sum(trs[:per])/per
+        for t in trs[per:]: a=(a*(per-1)+t)/per
         return a
     def _rsi(self, prices, per):
-        if len(prices)<per+1: return 50
+        if len(prices)<per+1: return None
         ds=[prices[i]-prices[i-1] for i in range(1,len(prices))]
-        g=[max(d,0) for d in ds]; l=[max(-d,0) for d in ds]
-        k=2/(per+1); ag=g[0]; al=l[0]
-        for i in range(1,len(g)): ag=g[i]*k+ag*(1-k); al=l[i]*k+al*(1-k)
-        if al==0: return 100
+        gs=[max(d,0) for d in ds]; ls=[max(-d,0) for d in ds]
+        ag=sum(gs[:per])/per; al=sum(ls[:per])/per
+        for i in range(per,len(ds)):
+            ag=(ag*(per-1)+gs[i])/per; al=(al*(per-1)+ls[i])/per
+        if al==0: return 100 if ag>0 else 50
         return 100-(100/(1+ag/al))
 
 # ============================================================
@@ -503,16 +507,19 @@ def daemon_loop(args):
 
             state.add_price(price)
 
-            # 2. Fetch position (every 3rd cycle = ~15 min)
-            cycle = int(time.time() / POLL_SECONDS) % 3
+            # 2. Fetch position when wall-clock elapsed exceeds interval (default 15 min).
             pid = state.get("position_id")
-            if cycle == 0 and pid:
+            pos_interval = int(strategy.cfg.get("data_sources",{}).get("position_poll_interval_seconds", 900))
+            last_pos_fetch = state.data.get("last_position_fetch_ts", 0)
+            if pid and (time.time() - last_pos_fetch) >= pos_interval:
                 pos = fetch_position(pid)
                 if pos:
                     if state.get("range_lo") != pos["lo"] or state.get("range_hi") != pos["hi"]:
                         log(f"Position updated: ${pos['lo']:.0f}-${pos['hi']:.0f}")
                     state.set("range_lo", pos["lo"])
                     state.set("range_hi", pos["hi"])
+                    state.data["last_position_fetch_ts"] = time.time()
+                    state.save()
 
             # 3. Evaluate strategy
             rlo = state.get("range_lo", 0)
@@ -526,7 +533,9 @@ def daemon_loop(args):
 
             # Status line
             status_sym = {"green":"🟢","yellow":"🟡","red":"🔴","exit":"🚪","enter":"🔄","closed":"📦","gray":"⚪"}
-            log(f"{status_sym.get(status,'?')} ETH ${price:,.0f} | Range ${rlo:,.0f}-${rhi:,.0f} | {status} | trend {det.get('trend_pct',0):+.1f}% | RSI {det.get('rsi',50):.0f}")
+            _rsi = det.get('rsi')
+            _rsi_s = f"{_rsi:.0f}" if isinstance(_rsi,(int,float)) else "?"
+            log(f"{status_sym.get(status,'?')} ETH ${price:,.0f} | Range ${rlo:,.0f}-${rhi:,.0f} | {status} | trend {det.get('trend_pct',0):+.1f}% | RSI {_rsi_s}")
 
             # 4. Act if there's a signal
             if action:
