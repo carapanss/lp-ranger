@@ -30,6 +30,7 @@ mkdir -p "$INSTALL_DIR/icons"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cp "$SCRIPT_DIR/lp_ranger.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/lp_core.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/strategy_v1.json" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/strategy_aggressive.json" "$INSTALL_DIR/" 2>/dev/null || true
 cp "$SCRIPT_DIR/strategy_exit_pool.json" "$INSTALL_DIR/" 2>/dev/null || true
