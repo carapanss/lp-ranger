@@ -523,6 +523,39 @@ class Term(Gtk.Box):
                 self._cached_pw = None
                 self._cached_pk = None
                 GLib.idle_add(self.wl,"Password incorrecto. Usa 'unlock' para reintentar.","red")
+            # On successful enter/rebalance, pull the new tokenId and range
+            # out of the autobot output and push them into the live config so
+            # the GUI immediately tracks the new NFT instead of still polling
+            # the stale closed one.
+            if r.returncode == 0 and verb in ("enter","rebalance"):
+                out = r.stdout + r.stderr
+                m = re.search(r"tokenId:\s*(\d+)", out)
+                if m:
+                    new_pid = m.group(1)
+                    self.app.config.set("position_id", new_pid)
+                    GLib.idle_add(self.wl,f"  Nueva Position ID: {new_pid}","green")
+                # Parse the new range from the "Range: $LO — $HI" line
+                mr = re.search(r"Range:\s*\$([\d,\.]+)\s*—\s*\$([\d,\.]+)", out)
+                if mr:
+                    lo = float(mr.group(1).replace(",",""))
+                    hi = float(mr.group(2).replace(",",""))
+                    self.app.config.set("range_lo", lo)
+                    self.app.config.set("range_hi", hi)
+                self.app.stats.set("pool_active", True)
+                self.app.stats.set("hold_asset", None)
+                GLib.idle_add(self.app.force_update)
+            if r.returncode == 0 and verb == "exit":
+                # Pool closed — clear range so the GUI doesn't ghost-poll it.
+                self.app.config.set("range_lo", 0)
+                self.app.config.set("range_hi", 0)
+                self.app.stats.set("pool_active", False)
+                # Infer hold_asset from the command line if present.
+                hold = "USDC"
+                for i,tk in enumerate(parts):
+                    if tk == "--hold" and i+1 < len(parts):
+                        hold = parts[i+1].upper()
+                self.app.stats.set("hold_asset", hold)
+                GLib.idle_add(self.app.force_update)
         except subprocess.TimeoutExpired:
             GLib.idle_add(self.wl,"Timeout (10 min)","red")
         except Exception as e:GLib.idle_add(self.wl,f"Error: {e}","red")
