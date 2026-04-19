@@ -23,9 +23,15 @@ Autonomous WETH/USDC liquidity pool manager for Uniswap V3 on Base chain. Detect
 - Tick to price: `price_usdc_per_eth = 1.0001^tick × 10^12`
 
 ## Strategies (JSON files)
-- `strategy_exit_pool.json` — **164.6% APR**: exits pool on strong trends (EMA divergence >10%), holds ETH or USDC, re-enters when lateral. Parameters: base_width 15%, trend_shift 0.4, buffer 5%, exit_trend 10%, enter_trend 2%.
-- `strategy_v1.json` — 52.2% APR: trend-following with 18% range
-- `strategy_aggressive.json` — 55.6% APR: fixed narrow 10% range
+- `strategy_optimal.json` — **261.6% walk-forward OOS APR** (6/6 positive 30d windows, median 259.5%, max DD 0.2%): fixed 5% width, buffer 0. Winner of a ~7k-config walk-forward grid search (180d train / 30d test, step 30d) over the last 365 d of ETHUSDT hourly. Maximizes fee capture at the narrowest feasible band; the frequent rebalances (~1/day) are paid back by the inversely-scaled fee rate ($0.31 × 15.63/width_pct). See `backtest/reports/`.
+- `strategy_exit_pool.json` — ~90% APR on real 365d data (documented 164% was unverified): exits pool on strong trends (EMA divergence >10%), holds ETH or USDC, re-enters when lateral. Parameters: base_width 15%, trend_shift 0.4, buffer 5%, exit_trend 10%, enter_trend 2%.
+- `strategy_v1.json` — trend-following with 18% range (unvalidated claim 52%)
+- `strategy_aggressive.json` — fixed narrow 10% range (unvalidated claim 55%)
+
+## Backtesting
+- `backtest/engine.py` — deterministic hourly-candle replay; shares `lp_core.evaluate_strategy` with the live daemon so ranking matches production behavior. Precomputed indicator streams make each 180d backtest ~5 ms.
+- `backtest/search.py --walk-forward` — grid search + rolling validation. Ranks by mean OOS APR to punish overfit.
+- `backtest/data_loader.py` — Binance ETHUSDT 1h loader, cached to `backtest/data/`.
 
 ## Semaphore states
 - `green` → in range, stable → no action

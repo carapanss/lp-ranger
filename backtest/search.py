@@ -14,7 +14,7 @@ from itertools import product
 from pathlib import Path
 
 import lp_core
-from backtest.engine import run_backtest
+from backtest.engine import run_backtest, precompute_indicators
 
 REPO = Path(__file__).resolve().parent.parent
 REPORTS_DIR = REPO / "backtest" / "reports"
@@ -50,22 +50,31 @@ INDICATOR_GRID = {
 
 
 def _cfgs_for(strategy_type):
-    """Yield all cfgs for a given strategy_type."""
+    """Yield all cfgs for a given strategy_type.
+
+    The `fixed` strategy does not use any indicators for signal generation,
+    so its cfgs are emitted with the default indicator combo only — this
+    avoids 6x wasted work and keeps each fixed point unique in the summary.
+    """
     pg = GRIDS[strategy_type]
     pkeys = list(pg.keys())
-    ikeys = list(INDICATOR_GRID.keys())
+    if strategy_type == "fixed":
+        ind_iter = [{"ema_fast": 20, "ema_slow": 50,
+                     "atr_period": 14, "rsi_period": 14}]
+    else:
+        ikeys = list(INDICATOR_GRID.keys())
+        ind_iter = [dict(zip(ikeys, ic))
+                    for ic in product(*(INDICATOR_GRID[k] for k in ikeys))]
     for pcombo in product(*(pg[k] for k in pkeys)):
-        for icombo in product(*(INDICATOR_GRID[k] for k in ikeys)):
+        for ind in ind_iter:
             params = dict(zip(pkeys, pcombo))
-            ind = dict(zip(ikeys, icombo))
             cfg = {
                 "name": f"grid_{strategy_type}",
                 "version": "grid",
                 "strategy_type": strategy_type,
                 "parameters": params,
-                "data_sources": {"indicators": ind},
+                "data_sources": {"indicators": dict(ind)},
             }
-            # fixed strategies use width_pct (legacy key) alongside base_width_pct
             if strategy_type == "fixed":
                 cfg["parameters"]["width_pct"] = cfg["parameters"]["base_width_pct"]
             yield cfg
@@ -100,13 +109,23 @@ def slice_candles(candles, start_day, end_day):
 
 def grid_search_one_window(candles_train):
     """For every cfg in every strategy_type, run train backtest and return
-    the top cfg per strategy_type (by net APR)."""
+    the top cfg per strategy_type (by net APR).
+
+    Indicators are precomputed once per indicator_combo and shared across
+    all param combos — amortises the O(n) sweep, giving ~50x speedup.
+    """
     best_by_type = {}
+    # Cache indicators by (ema_fast, ema_slow, atr_period, rsi_period)
+    ind_cache = {}
     for stype in GRIDS:
         best = None
         for cfg in _cfgs_for(stype):
+            ic = cfg["data_sources"]["indicators"]
+            key = (ic["ema_fast"], ic["ema_slow"], ic["atr_period"], ic["rsi_period"])
+            if key not in ind_cache:
+                ind_cache[key] = precompute_indicators(candles_train, ic)
             try:
-                r = run_backtest(cfg, candles_train)
+                r = run_backtest(cfg, candles_train, indicators=ind_cache[key])
             except Exception:
                 continue
             if best is None or r.net_apr > best[1].net_apr:

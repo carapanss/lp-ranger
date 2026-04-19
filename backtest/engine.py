@@ -74,11 +74,17 @@ def run_backtest(cfg, candles, *,
                  fee_width_ref=DEFAULT_FEE_WIDTH_REF,
                  cooldown_hours=DEFAULT_COOLDOWN_H,
                  max_actions_per_day=DEFAULT_MAX_ACTIONS_PER_DAY,
-                 hist_cap=400) -> BacktestResult:
+                 hist_cap=400,
+                 indicators=None) -> BacktestResult:
     """Replay the candle stream under `cfg`. Returns a BacktestResult.
 
     Candle shape: {'t': unix_ms, 'p': close_usd}.
     Assumes hourly candles (scales fee accrual by 1/24 of the daily rate).
+
+    If `indicators` is provided (a dict with keys ema_fast/ema_slow/atr/rsi,
+    each a list[float|None] aligned with candles), the hot inner loop uses
+    them directly — 50-100x faster than recomputing per tick. Otherwise the
+    series are computed once from `candles` at entry.
     """
     if not candles:
         return BacktestResult()
@@ -87,33 +93,52 @@ def run_backtest(cfg, candles, *,
     if errs:
         raise ValueError(f"invalid cfg: {errs}")
 
-    # ── Determine initial state: open pool at first warm-up tick ──
     ic = cfg.get("data_sources", {}).get("indicators", {})
     need = lp_core.warm_samples(ic)
 
-    # Local mutable state (avoid reconstructing dicts each tick)
+    # Precompute indicator streams if not supplied
+    if indicators is None:
+        prices_arr = [c["p"] for c in candles]
+        indicators = {
+            "ema_fast": lp_core.ema_series(prices_arr, int(ic.get("ema_fast", 20))),
+            "ema_slow": lp_core.ema_series(prices_arr, int(ic.get("ema_slow", 50))),
+            "atr":      lp_core.atr_series(prices_arr, int(ic.get("atr_period", 14))),
+            "rsi":      lp_core.rsi_series(prices_arr, int(ic.get("rsi_period", 14))),
+        }
+    ema_fast_arr = indicators["ema_fast"]
+    ema_slow_arr = indicators["ema_slow"]
+    atr_arr = indicators["atr"]
+    rsi_arr = indicators["rsi"]
+
+    p = cfg.get("parameters", {})
+    strategy_type = cfg.get("strategy_type", "exit_pool")
+    base_width_pct = float(p.get("base_width_pct", p.get("width_pct", 15)))
+    trend_shift = float(p.get("trend_shift", 0.4))
+    buffer_pct = float(p.get("buffer_pct", 5))
+    exit_trend_pct = float(p.get("exit_trend_pct", 10))
+    enter_trend_pct = float(p.get("enter_trend_pct", 2))
+
     range_lo = 0.0
     range_hi = 0.0
-    entry_price = 0.0          # price at which current range was opened (midpoint)
-    pool_basis = 0.0           # USD basis tracked inside the pool
-    cash_usd = position_usd    # start in USDC
+    entry_price = 0.0
+    pool_basis = 0.0
+    cash_usd = position_usd
     eth_held = 0.0
     pool_active = False
     hold_asset = "USDC"
-    price_hist: list[float] = []
 
     last_action_s = -10 * 86400
     actions_today = 0
     current_day_idx = -1
     cooldown_s = cooldown_hours * 3600
 
-    # Hourly candle spacing check (for fee scaling)
     if len(candles) >= 2:
         hours_per_candle = (candles[1]["t"] - candles[0]["t"]) / 3600000.0
     else:
         hours_per_candle = 1.0
     if hours_per_candle <= 0:
         hours_per_candle = 1.0
+    fee_per_tick_factor = hours_per_candle / 24.0
 
     equity_curve: list[tuple[int, float]] = []
     total_fees = 0.0
@@ -122,36 +147,33 @@ def run_backtest(cfg, candles, *,
     n_rebalances = 0
     n_exits = 0
     n_enters = 0
-
     time_in_pool = 0
     time_in_eth = 0
     time_in_usdc = 0
 
-    start_ts = candles[0]["t"]
-    end_ts = candles[-1]["t"]
+    import math as _m
 
-    for candle in candles:
+    for idx, candle in enumerate(candles):
         t_ms = candle["t"]
         price = float(candle["p"])
         t_s = t_ms / 1000.0
 
-        # Day-boundary reset
         day_idx = int(t_s // 86400)
         if day_idx != current_day_idx:
             current_day_idx = day_idx
             actions_today = 0
 
-        price_hist.append(price)
-        if len(price_hist) > hist_cap:
-            price_hist = price_hist[-hist_cap:]
+        # Warm-up gate
+        warmed = idx >= need
+        ef = ema_fast_arr[idx] if warmed else None
+        es = ema_slow_arr[idx] if warmed else None
+        rs = rsi_arr[idx] if warmed else None
 
-        # ── Bootstrap: once warmed up, open a pool at first green-ish tick ──
-        if not pool_active and hold_asset == "USDC" and eth_held == 0 and \
-                cash_usd > 0 and len(price_hist) >= need and entry_price == 0:
-            bw = float(cfg.get("parameters", {}).get("base_width_pct",
-                       cfg.get("parameters", {}).get("width_pct", 15)))
-            range_lo = price * (1 - bw / 200)
-            range_hi = price * (1 + bw / 200)
+        # Bootstrap a pool on the first warmed tick
+        if (warmed and not pool_active and hold_asset == "USDC"
+                and eth_held == 0 and cash_usd > 0 and entry_price == 0):
+            range_lo = price * (1 - base_width_pct / 200)
+            range_hi = price * (1 + base_width_pct / 200)
             entry_price = price
             pool_basis = cash_usd
             cash_usd = 0
@@ -160,11 +182,14 @@ def run_backtest(cfg, candles, *,
             total_gas += gas_usd_per_action
             n_enters += 1
 
-        # Mark-to-market equity — always sum all three buckets
-        pool_mtm = (_pool_value(pool_basis, range_lo, range_hi, entry_price, price)
-                    if pool_active else 0.0)
+        # Mark-to-market
+        if pool_active and entry_price > 0 and price > 0:
+            r_p = price / entry_price
+            factor = 2 * _m.sqrt(r_p) / (1 + r_p) if r_p > 0 else 1.0
+            pool_mtm = pool_basis * factor
+        else:
+            pool_mtm = 0.0
         equity = pool_mtm + cash_usd + eth_held * price
-
         equity_curve.append((t_ms, equity))
 
         if pool_active:
@@ -174,59 +199,90 @@ def run_backtest(cfg, candles, *,
         else:
             time_in_usdc += 1
 
-        # ── Fees (only when in-range & pool active) ──
+        # Fees while in-range
         if pool_active and range_lo <= price <= range_hi:
             width_pct = (range_hi - range_lo) / ((range_lo + range_hi) / 2) * 100
             daily_fee = fee_daily_base * (fee_width_ref / max(width_pct, 1.0))
-            # Scale the daily rate to per candle and proportionally to the
-            # user's actual position_usd vs the $119.50 reference the
-            # constants were fitted on.
             scale = (equity / 119.50) if equity > 0 else 1.0
-            fee_this_tick = daily_fee * (hours_per_candle / 24.0) * scale
+            fee_this_tick = daily_fee * fee_per_tick_factor * scale
             total_fees += fee_this_tick
-            cash_usd += fee_this_tick  # bank fees as cash so they don't re-enter IL
+            cash_usd += fee_this_tick
 
-        # ── Strategy signal ──
-        state = {"range_lo": range_lo, "range_hi": range_hi,
-                 "pool_active": pool_active, "hold_asset": hold_asset}
-        signal, action, _ = lp_core.evaluate_strategy(cfg, price, state, price_hist)
-
-        if not action:
+        if not warmed:
             continue
 
-        # ── Cooldown + daily cap ──
+        # Compute trend signals inline
+        if ef is None or es is None or es == 0:
+            continue
+        tp = (ef - es) / es * 100
+        tu = ef > es
+
+        action = None
+
+        if not pool_active:
+            if abs(tp) < enter_trend_pct:
+                hw = base_width_pct / 200
+                sh = hw * trend_shift * min(abs(tp) / 100 * 8, 1)
+                nc = price * (1 + sh) if tu else price * (1 - sh)
+                action = ("enter_pool",
+                          nc * (1 - base_width_pct / 200),
+                          nc * (1 + base_width_pct / 200),
+                          None)
+            elif hold_asset == "ETH" and rs is not None and rs < 35:
+                action = ("enter_pool",
+                          price * (1 - base_width_pct / 200),
+                          price * (1 + base_width_pct / 200),
+                          None)
+            elif hold_asset == "USDC" and rs is not None and rs > 65:
+                action = ("enter_pool",
+                          price * (1 - base_width_pct / 200),
+                          price * (1 + base_width_pct / 200),
+                          None)
+        else:
+            inr = range_lo <= price <= range_hi
+            if strategy_type == "exit_pool" and abs(tp) > exit_trend_pct:
+                action = ("exit_pool", 0, 0, "ETH" if tp > 0 else "USDC")
+            elif (not inr and
+                  (price < range_lo * (1 - buffer_pct / 100)
+                   or price > range_hi * (1 + buffer_pct / 100))):
+                hw = base_width_pct / 200
+                sh = hw * trend_shift * min(abs(tp) / 100 * 8, 1)
+                nc = price * (1 + sh) if tu else price * (1 - sh)
+                action = ("rebalance",
+                          nc * (1 - base_width_pct / 200),
+                          nc * (1 + base_width_pct / 200),
+                          None)
+
+        if action is None:
+            continue
         if t_s - last_action_s < cooldown_s:
             continue
         if actions_today >= max_actions_per_day:
             continue
 
-        atype = action["type"]
+        atype, alo, ahi, ahold = action
         total_gas += gas_usd_per_action
         last_action_s = t_s
         actions_today += 1
 
         if atype == "rebalance":
-            # Realize IL on the outgoing range
             _, il_usd = lp_core.il_estimate(range_lo, range_hi, price, pool_basis)
             total_il += il_usd
-            # Update position basis to current MTM (keeping fees captured on cash side)
-            pool_basis = _pool_value(pool_basis, range_lo, range_hi, entry_price, price) - il_usd
+            pool_basis = pool_mtm - il_usd
             if pool_basis < 0:
                 pool_basis = 0
-            range_lo = float(action["lo"])
-            range_hi = float(action["hi"])
+            range_lo = alo
+            range_hi = ahi
             entry_price = price
             n_rebalances += 1
 
         elif atype == "exit_pool":
-            # Realize IL, then convert the pool basis into ETH or USDC
             _, il_usd = lp_core.il_estimate(range_lo, range_hi, price, pool_basis)
             total_il += il_usd
-            mtm = _pool_value(pool_basis, range_lo, range_hi, entry_price, price) - il_usd
+            mtm = pool_mtm - il_usd
             if mtm < 0:
                 mtm = 0
-            held = action.get("hold", "USDC")
-            if held == "ETH":
+            if ahold == "ETH":
                 eth_held += mtm / price if price > 0 else 0
                 hold_asset = "ETH"
             else:
@@ -240,31 +296,28 @@ def run_backtest(cfg, candles, *,
             n_exits += 1
 
         elif atype == "enter_pool":
-            # Move cash + eth into a fresh pool at the given range
             if hold_asset == "ETH":
                 cash_usd += eth_held * price
                 eth_held = 0
             pool_basis = cash_usd
             cash_usd = 0
-            range_lo = float(action["lo"])
-            range_hi = float(action["hi"])
+            range_lo = alo
+            range_hi = ahi
             entry_price = price
             pool_active = True
-            hold_asset = "USDC"  # reset on re-entry
+            hold_asset = "USDC"
             n_enters += 1
 
-    # Final mark-to-market
-    if equity_curve:
-        final_equity = equity_curve[-1][1]
-    else:
-        final_equity = position_usd
-
-    elapsed_ms = (end_ts - start_ts) if end_ts > start_ts else 1
+    # Summary
+    final_equity = equity_curve[-1][1] if equity_curve else position_usd
+    start_ts = candles[0]["t"]
+    end_ts = candles[-1]["t"]
+    elapsed_ms = max(end_ts - start_ts, 1)
     elapsed_days = elapsed_ms / 86400000.0
     if elapsed_days <= 0:
         elapsed_days = 1 / 24
-
     net_apr = ((final_equity / position_usd) - 1) * (365.0 / elapsed_days) * 100
+
     peak = position_usd
     max_dd = 0.0
     for _, eq in equity_curve:
@@ -274,9 +327,7 @@ def run_backtest(cfg, candles, *,
         if dd > max_dd:
             max_dd = dd
 
-    total_ticks = len(equity_curve)
-    if total_ticks == 0:
-        total_ticks = 1
+    total_ticks = len(equity_curve) or 1
 
     return BacktestResult(
         equity_curve=equity_curve,
@@ -295,3 +346,18 @@ def run_backtest(cfg, candles, *,
         end_ts=end_ts,
         elapsed_days=round(elapsed_days, 1),
     )
+
+
+def precompute_indicators(candles, ic):
+    """Return {ema_fast, ema_slow, atr, rsi} streams aligned with `candles`.
+
+    Shared across all configs with the same indicator combo to amortise
+    the O(n) work of a full indicator sweep.
+    """
+    prices = [c["p"] for c in candles]
+    return {
+        "ema_fast": lp_core.ema_series(prices, int(ic.get("ema_fast", 20))),
+        "ema_slow": lp_core.ema_series(prices, int(ic.get("ema_slow", 50))),
+        "atr":      lp_core.atr_series(prices, int(ic.get("atr_period", 14))),
+        "rsi":      lp_core.rsi_series(prices, int(ic.get("rsi_period", 14))),
+    }

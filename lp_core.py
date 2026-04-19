@@ -100,6 +100,65 @@ def rsi(prices, per):
     return 100 - (100 / (1 + ag / al))
 
 
+# ── Streaming indicator variants (backtest hot path) ──
+# Each returns a list of length len(prices) with None until the indicator
+# is warmed up. These do a single pass so the backtest can precompute the
+# full stream per (window, indicator_combo) once.
+
+def ema_series(prices, per):
+    out = [None] * len(prices)
+    if len(prices) < per or per <= 0:
+        return out
+    k = 2 / (per + 1)
+    e = sum(prices[:per]) / per
+    out[per - 1] = e
+    for i in range(per, len(prices)):
+        e = prices[i] * k + e * (1 - k)
+        out[i] = e
+    return out
+
+
+def atr_series(prices, per):
+    out = [None] * len(prices)
+    if len(prices) < per + 1 or per <= 0:
+        return out
+    trs = [0.0] + [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+    a = sum(trs[1:per + 1]) / per
+    out[per] = a
+    for i in range(per + 1, len(prices)):
+        a = (a * (per - 1) + trs[i]) / per
+        out[i] = a
+    return out
+
+
+def rsi_series(prices, per):
+    out = [None] * len(prices)
+    if len(prices) < per + 1 or per <= 0:
+        return out
+    gs = [0.0] * len(prices)
+    ls = [0.0] * len(prices)
+    for i in range(1, len(prices)):
+        d = prices[i] - prices[i - 1]
+        if d > 0:
+            gs[i] = d
+        else:
+            ls[i] = -d
+    ag = sum(gs[1:per + 1]) / per
+    al = sum(ls[1:per + 1]) / per
+    if al == 0:
+        out[per] = 100 if ag > 0 else 50
+    else:
+        out[per] = 100 - (100 / (1 + ag / al))
+    for i in range(per + 1, len(prices)):
+        ag = (ag * (per - 1) + gs[i]) / per
+        al = (al * (per - 1) + ls[i]) / per
+        if al == 0:
+            out[i] = 100 if ag > 0 else 50
+        else:
+            out[i] = 100 - (100 / (1 + ag / al))
+    return out
+
+
 def il_estimate(old_lo, old_hi, current_price, position_value):
     """Standard V2 IL formula * bounded V3 concentration amplifier.
 

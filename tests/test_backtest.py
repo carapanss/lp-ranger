@@ -116,10 +116,10 @@ def test_grid_size_bounded():
     n_fixed = sum(1 for _ in _cfgs_for("fixed"))
     # 6*5*4*3*3 * 2*3 = 6480 for exit_pool
     # 6*4*3 * 2*3 = 432 for trend_following
-    # 8*3 * 2*3 = 144 for fixed
+    # 8*3 * 1 = 24 for fixed (indicators don't affect fixed signals)
     assert n_exit == 6 * 5 * 4 * 3 * 3 * 2 * 3
     assert n_trend == 6 * 4 * 3 * 2 * 3
-    assert n_fixed == 8 * 3 * 2 * 3
+    assert n_fixed == 8 * 3
     # Total must fit 6 walk-forward windows in ~10 min
     total = n_exit + n_trend + n_fixed
     assert total < 10000

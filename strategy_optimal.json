@@ -1,0 +1,26 @@
+{
+  "name": "Optimal (fixed)",
+  "version": "1.0",
+  "strategy_type": "fixed",
+  "description": "Walk-forward winner. Mean OOS APR 261.59% across 6 windows.",
+  "parameters": {
+    "base_width_pct": 5,
+    "buffer_pct": 0,
+    "width_pct": 5
+  },
+  "data_sources": {
+    "indicators": {
+      "atr_period": 14,
+      "ema_fast": 20,
+      "ema_slow": 50,
+      "rsi_period": 14
+    },
+    "position_poll_interval_seconds": 900
+  },
+  "backtest_results": {
+    "mean_oos_apr_pct": 261.59,
+    "median_oos_apr_pct": 259.54,
+    "positive_windows": "6/6",
+    "avg_drawdown_pct": 0.16
+  }
+}
