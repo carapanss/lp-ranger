@@ -61,6 +61,7 @@ def _run_autobot(cmd, password=None, pk=None, **subprocess_kwargs):
 CONFIG_FILE = DATA_DIR / "config.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 STATS_FILE = DATA_DIR / "stats.json"
+PRICES_FILE = DATA_DIR / "prices_cache.json"
 DEFAULT_STRAT = APP_DIR / "strategy_exit_pool.json"
 if not DEFAULT_STRAT.exists(): DEFAULT_STRAT = APP_DIR / "strategy_v1.json"
 _DEFAULT_RPCS = [
@@ -218,7 +219,18 @@ _validate_strategy = lp_core.validate_strategy
 class Strat:
     DEFAULT_CFG = {"name":"Default","strategy_type":"exit_pool","parameters":{"base_width_pct":15,"trend_shift":0.4,"buffer_pct":5,"exit_trend_pct":10,"enter_trend_pct":2}}
     def __init__(self,path=None):
-        self.cfg={};self.prices=[];self.load(path or DEFAULT_STRAT)
+        self.cfg={};self.prices=self._load_prices();self.load(path or DEFAULT_STRAT)
+    def _load_prices(self):
+        # Persist price history across restarts so we don't sit gray for 4h
+        # warming up indicators every time. Drop entries older than 7d.
+        try:
+            data=_load_json(PRICES_FILE,[])
+            cutoff=time.time()-7*86400
+            return [(float(t),float(v)) for t,v in data if float(t)>cutoff]
+        except Exception: return []
+    def _save_prices(self):
+        try: _write_json(PRICES_FILE,[[t,v] for t,v in self.prices[-2000:]])
+        except Exception: pass
     def load(self,p):
         p=Path(p)
         if not p.exists():
@@ -236,7 +248,10 @@ class Strat:
             print(f"[Strat] Falling back to defaults.", file=sys.stderr)
             self.cfg=dict(self.DEFAULT_CFG);return
         self.cfg=cfg
-    def add(self,p):self.prices.append((time.time(),p));self.prices=[(t,v) for t,v in self.prices if t>time.time()-60*86400]
+    def add(self,p):
+        self.prices.append((time.time(),p))
+        self.prices=[(t,v) for t,v in self.prices if t>time.time()-60*86400]
+        self._save_prices()
     def _prices(self): return [p for _,p in self.prices]
     def _warm(self, ic): return len(self.prices) >= lp_core.warm_samples(ic)
     def _ema(self,per): return lp_core.ema(self._prices(), per)
