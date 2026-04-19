@@ -386,6 +386,12 @@ class TxBuilder:
                     continue
             if self.w3 is None:
                 raise RuntimeError(f"All RPCs unreachable; last error: {last_err}")
+
+            # Wrap the provider so rate limits / 5xx / timeouts rotate across
+            # endpoints instead of crashing the tx in flight. Without this a
+            # 429 from the public Base RPC mid-rebalance leaves the position
+            # closed + a half-filled wallet — ask me how I know.
+            self._install_rpc_failover()
             self.account = self.w3.eth.account.from_key(private_key)
             self.address = self.account.address
             self.slippage = slippage
@@ -419,6 +425,56 @@ class TxBuilder:
             print("ERROR: web3 package required. Install with:")
             print("  pip install web3 --break-system-packages")
             sys.exit(1)
+
+    def _install_rpc_failover(self):
+        """Wrap the provider's make_request so rate limits and transient
+        HTTP errors rotate to the next endpoint instead of exploding.
+
+        This survives the web3 provider caching its session — we build a
+        fresh HTTPProvider on each rotation and reuse the new session for
+        subsequent calls.
+        """
+        from web3 import Web3
+        import requests
+
+        w3 = self.w3
+        endpoints = list(RPC_ENDPOINTS)
+        state = {"idx": 0}
+        # Keep the original bound make_request so we can call it cleanly.
+        orig = w3.provider.make_request
+
+        def rotating(method, params):
+            last_err = None
+            max_attempts = max(len(endpoints), 1) * 2
+            for attempt in range(max_attempts):
+                try:
+                    return state["fn"](method, params)
+                except requests.exceptions.HTTPError as e:
+                    code = getattr(e.response, "status_code", 0)
+                    if code not in (429, 500, 502, 503, 504):
+                        raise
+                    last_err = e
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ChunkedEncodingError) as e:
+                    last_err = e
+                # Rotate to the next endpoint and back off a bit.
+                state["idx"] = (state["idx"] + 1) % len(endpoints)
+                new_url = endpoints[state["idx"]]
+                try:
+                    new_provider = Web3.HTTPProvider(
+                        new_url, request_kwargs={"timeout": 30},
+                    )
+                    w3.provider = new_provider
+                    state["fn"] = new_provider.make_request
+                    print(f"[AutoBot] RPC rotated -> {new_url}")
+                except Exception as e:
+                    last_err = e
+                time.sleep(min(1.0 + attempt * 0.5, 4.0))
+            raise last_err or RuntimeError("all RPCs failed")
+
+        state["fn"] = orig
+        w3.provider.make_request = rotating
 
     def _get_nonce(self):
         """Return next nonce, serialised via lock to avoid collisions."""
