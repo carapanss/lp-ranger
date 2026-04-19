@@ -118,3 +118,120 @@ def il_estimate(old_lo, old_hi, current_price, position_value):
     amp = min(math.sqrt(100 / max(width_pct, 5)), 4.0)
     il_pct = min(il_v2 * amp, 0.20)
     return il_pct, il_pct * position_value
+
+
+def evaluate_strategy(cfg, price, state, price_history):
+    """Pure signal engine shared by lp_daemon and the backtest.
+
+    Inputs:
+      cfg             strategy config (same shape validated by validate_strategy).
+      price           current price (float, USD per ETH).
+      state           dict with keys range_lo, range_hi, pool_active, hold_asset.
+      price_history   list of floats OR list of {'p': float, ...}.
+
+    Returns (signal, action_or_None, details):
+      signal ∈ {gray, green, yellow, rebalance, exit, enter, closed}
+      action: when non-None, a dict with keys:
+        type ∈ {rebalance, exit_pool, enter_pool}, and one of:
+          {lo, hi, width, reason}  for rebalance / enter_pool
+          {hold: 'ETH'|'USDC', reason}  for exit_pool
+      details: indicator snapshot (trend, trend_pct, rsi, ema_fast/slow, vol, atr).
+    """
+    p = cfg.get("parameters", {}) if isinstance(cfg, dict) else {}
+    st = cfg.get("strategy_type", "exit_pool") if isinstance(cfg, dict) else "exit_pool"
+    ic = cfg.get("data_sources", {}).get("indicators", {}) if isinstance(cfg, dict) else {}
+
+    if price_history and isinstance(price_history[0], dict):
+        prices = [x["p"] for x in price_history]
+    else:
+        prices = list(price_history)
+
+    need = warm_samples(ic)
+    if len(prices) < need:
+        return "gray", None, {"warming_up": True,
+                              "message": f"Warming up ({len(prices)}/{need} samples)"}
+
+    ef = ema(prices, int(ic.get("ema_fast", 20)))
+    es = ema(prices, int(ic.get("ema_slow", 50)))
+    at = atr(prices, int(ic.get("atr_period", 14)))
+    rs = rsi(prices, int(ic.get("rsi_period", 14)))
+    vp = (at / price * 100) if (at is not None and price > 0) else 0
+    tu = (ef is not None and es is not None and ef > es)
+    tp = ((ef - es) / es * 100) if (ef is not None and es is not None and es > 0) else 0
+
+    det = {"price": price,
+           "trend": "up" if tu else "down",
+           "trend_pct": round(tp, 2),
+           "ema_fast": round(ef, 2) if ef is not None else None,
+           "ema_slow": round(es, 2) if es is not None else None,
+           "rsi": round(rs, 1) if rs is not None else None,
+           "vol": round(vp, 2),
+           "atr": round(at, 2) if at is not None else None}
+
+    rlo = state.get("range_lo", 0) or 0
+    rhi = state.get("range_hi", 0) or 0
+    pool_active = state.get("pool_active", True)
+    hold_asset = state.get("hold_asset")
+
+    if not pool_active:
+        nt = p.get("enter_trend_pct", 2)
+        bw = p.get("base_width_pct", 15)
+        if abs(tp) < nt:
+            hw = bw / 200
+            ts2 = p.get("trend_shift", 0.4)
+            sh = hw * ts2 * min(abs(tp) / 100 * 8, 1)
+            nc = price * (1 + sh) if tu else price * (1 - sh)
+            return "enter", {"type": "enter_pool",
+                             "lo": round(nc * (1 - bw / 200), 2),
+                             "hi": round(nc * (1 + bw / 200), 2),
+                             "width": bw,
+                             "reason": f"Lateralizacion (trend {tp:+.1f}%)"}, det
+        h = hold_asset or "USDC"
+        if h == "ETH" and rs is not None and rs < 35:
+            return "enter", {"type": "enter_pool",
+                             "lo": round(price * (1 - bw / 200), 2),
+                             "hi": round(price * (1 + bw / 200), 2),
+                             "width": bw,
+                             "reason": f"RSI {rs:.0f}, reversion"}, det
+        if h == "USDC" and rs is not None and rs > 65:
+            return "enter", {"type": "enter_pool",
+                             "lo": round(price * (1 - bw / 200), 2),
+                             "hi": round(price * (1 + bw / 200), 2),
+                             "width": bw,
+                             "reason": f"RSI {rs:.0f}, reversion"}, det
+        return "closed", None, det
+
+    if rlo <= 0 or rhi <= 0:
+        det["message"] = "No range set"
+        return "gray", None, det
+
+    inr = rlo <= price <= rhi
+
+    if st == "exit_pool" and abs(tp) > p.get("exit_trend_pct", 10):
+        h = "ETH" if tp > 0 else "USDC"
+        return "exit", {"type": "exit_pool", "hold": h,
+                        "reason": f"Tendencia fuerte ({tp:+.1f}%), exit -> {h}"}, det
+
+    buf = p.get("buffer_pct", 5) / 100
+    if not inr and (price < rlo * (1 - buf) or price > rhi * (1 + buf)):
+        bw = p.get("base_width_pct", 15)
+        ts2 = p.get("trend_shift", 0.4)
+        hw = bw / 200
+        sh = hw * ts2 * min(abs(tp) / 100 * 8, 1)
+        nc = price * (1 + sh) if tu else price * (1 - sh)
+        return "rebalance", {"type": "rebalance",
+                             "lo": round(nc * (1 - bw / 200), 2),
+                             "hi": round(nc * (1 + bw / 200), 2),
+                             "width": bw,
+                             "reason": f"Fuera de rango, trend {tp:+.1f}%"}, det
+
+    if not inr:
+        return "yellow", None, det
+
+    rw = rhi - rlo
+    edge = min(price - rlo, rhi - price) / rw * 100 if rw > 0 else 0
+    det["edge_dist_pct"] = round(edge, 1)
+    if edge < 5:
+        return "yellow", None, det
+
+    return "green", None, det

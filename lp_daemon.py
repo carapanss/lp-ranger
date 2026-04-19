@@ -229,89 +229,9 @@ class Strategy:
         log(f"Strategy loaded: {self.cfg.get('name','?')}")
 
     def evaluate(self, price, rlo, rhi, pool_active, hold_asset, price_history):
-        p = self.cfg.get("parameters", {})
-        st = self.cfg.get("strategy_type", "exit_pool")
-        ic = self.cfg.get("data_sources",{}).get("indicators",{})
-
-        prices = [x["p"] for x in price_history]
-        need = lp_core.warm_samples(ic)
-        if len(prices) < need:
-            return "gray", None, {"message": f"Warming up ({len(prices)}/{need} samples)", "warming_up": True}
-
-        ef = self._ema(prices, ic.get("ema_fast",20))
-        es = self._ema(prices, ic.get("ema_slow",50))
-        atr = self._atr(prices, ic.get("atr_period",14))
-        rsi = self._rsi(prices, ic.get("rsi_period",14))
-        vp = (atr/price*100) if (atr is not None and price>0) else 0
-        tu = (ef is not None and es is not None and ef > es)
-        tp = ((ef-es)/es*100) if (ef is not None and es is not None and es>0) else 0
-
-        det = {"price":price,"trend":"up" if tu else "down","trend_pct":round(tp,1),
-               "ema_fast":round(ef,2) if ef is not None else None,
-               "ema_slow":round(es,2) if es is not None else None,
-               "rsi":round(rsi,1) if rsi is not None else None,
-               "vol":round(vp,2),"atr":round(atr,2) if atr is not None else None}
-
-        # Pool closed → check for re-entry
-        if not pool_active:
-            nt = p.get("enter_trend_pct", 2)
-            if abs(tp) < nt:
-                bw = p.get("base_width_pct",15)
-                hw = bw/200; ts2 = p.get("trend_shift",0.4)
-                sh = hw*ts2*min(abs(tp)/100*8,1)
-                nc = price*(1+sh) if tu else price*(1-sh)
-                return "enter", {"type":"enter_pool","lo":round(nc*(1-bw/200),2),
-                    "hi":round(nc*(1+bw/200),2),"width":bw,
-                    "reason":f"Lateralización (trend {tp:+.1f}%)"}, det
-            h = hold_asset or "USDC"
-            if h=="ETH" and rsi is not None and rsi<35:
-                bw=p.get("base_width_pct",15)
-                return "enter",{"type":"enter_pool","lo":round(price*(1-bw/200),2),
-                    "hi":round(price*(1+bw/200),2),"width":bw,
-                    "reason":f"RSI {rsi:.0f}, reversión posible"},det
-            if h=="USDC" and rsi is not None and rsi>65:
-                bw=p.get("base_width_pct",15)
-                return "enter",{"type":"enter_pool","lo":round(price*(1-bw/200),2),
-                    "hi":round(price*(1+bw/200),2),"width":bw,
-                    "reason":f"RSI {rsi:.0f}, reversión posible"},det
-            return "closed", None, det
-
-        # Pool active
-        if rlo <= 0 or rhi <= 0:
-            return "gray", None, {"message": "No range set"}
-
-        inr = rlo <= price <= rhi
-
-        # Exit pool signal
-        if st == "exit_pool" and abs(tp) > p.get("exit_trend_pct",10):
-            h = "ETH" if tp > 0 else "USDC"
-            return "exit", {"type":"exit_pool","hold":h,
-                "reason":f"Tendencia fuerte ({tp:+.1f}%), exit → {h}"}, det
-
-        # Out of range
-        buf = p.get("buffer_pct",5)/100
-        if not inr and (price < rlo*(1-buf) or price > rhi*(1+buf)):
-            bw=p.get("base_width_pct",15); ts2=p.get("trend_shift",0.4)
-            hw=bw/200; sh=hw*ts2*min(abs(tp)/100*8,1)
-            nc = price*(1+sh) if tu else price*(1-sh)
-            return "rebalance", {"type":"rebalance","lo":round(nc*(1-bw/200),2),
-                "hi":round(nc*(1+bw/200),2),"width":bw,
-                "reason":f"Fuera de rango, trend {tp:+.1f}%"}, det
-
-        if not inr:
-            return "yellow", None, det
-
-        # Edge proximity
-        rw = rhi - rlo
-        edge = min(price-rlo, rhi-price)/rw*100 if rw>0 else 0
-        if edge < 5:
-            return "yellow", None, det
-
-        return "green", None, det
-
-    def _ema(self, prices, per): return lp_core.ema(prices, per)
-    def _atr(self, prices, per): return lp_core.atr(prices, per)
-    def _rsi(self, prices, per): return lp_core.rsi(prices, per)
+        state = {"range_lo": rlo, "range_hi": rhi,
+                 "pool_active": pool_active, "hold_asset": hold_asset}
+        return lp_core.evaluate_strategy(self.cfg, price, state, price_history)
 
 # ============================================================
 # CLAUDE CODE INTEGRATION
