@@ -617,7 +617,9 @@ class MainWindow(Gtk.Window):
         self.m["strat"].set_text(self.app.strategy.cfg.get("strategy_type","—"))
         self.lbl_sname.set_text(self.app.strategy.cfg.get("name","—"))
         bt=self.app.strategy.cfg.get("backtest_results",{})
-        self.lbl_sinfo.set_text(f"APR: {bt.get('net_apr','?')}% · Rebalanceos: {bt.get('rebalance_count','?')}/año")
+        apr=bt.get("mean_oos_apr_pct",bt.get("net_apr","?"))
+        rb=bt.get("rebalance_count",bt.get("positive_windows","?"))
+        self.lbl_sinfo.set_text(f"APR: {apr}% · {rb}")
         # Recommendation
         for c in self.rec_frame.get_children():self.rec_frame.remove(c)
         if rec:
@@ -706,13 +708,18 @@ class MainWindow(Gtk.Window):
         except:self.app.term.wl("Numeros invalidos","red")
     def _load_strat(self,btn):
         d=Gtk.FileChooserDialog(title="Estrategia .json",parent=self,action=Gtk.FileChooserAction.OPEN)
-        d.add_buttons(Gtk.STOCK_CANCEL,Gtk.ResponseType.CANCEL,Gtk.STOCK_OPEN,Gtk.ResponseType.OK)
+        d.add_buttons("Cancelar",Gtk.ResponseType.CANCEL,"Abrir",Gtk.ResponseType.OK)
         ft=Gtk.FileFilter();ft.set_name("JSON");ft.add_pattern("*.json");d.add_filter(ft)
-        if d.run()==Gtk.ResponseType.OK:
-            p=d.get_filename();self.app.strategy.load(p);self.app.config.set("strategy_file",p)
-            self.app.last_rec=None;self.app.history.log("strategy",os.path.basename(p))
-            self.app.term.wl(f"Estrategia: {os.path.basename(p)}","green");self.app.force_update()
+        try: d.set_current_folder(str(APP_DIR))
+        except Exception: pass
+        resp=d.run();p=d.get_filename() if resp in (Gtk.ResponseType.OK,Gtk.ResponseType.ACCEPT) else None
         d.destroy()
+        if p:
+            self.app.strategy.load(p);self.app.config.set("strategy_file",p)
+            self.app.last_rec=None;self.app.history.log("strategy",os.path.basename(p))
+            nm=self.app.strategy.cfg.get("name","?")
+            self.app.term.wl(f"Estrategia cargada: {nm} ({os.path.basename(p)})","green")
+            self.app.force_update()
 
 # ── App ──
 class App:
