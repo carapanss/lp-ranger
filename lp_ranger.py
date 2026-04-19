@@ -216,6 +216,64 @@ class Fetcher:
 
 _validate_strategy = lp_core.validate_strategy
 
+# ERC20 balanceOf selector (keccak("balanceOf(address)"))
+_BALANCE_OF_SELECTOR = "0x70a08231"
+WETH_ADDR = "0x4200000000000000000000000000000000000006"
+USDC_ADDR = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+def _rpc_call(method, params, timeout=10):
+    """JSON-RPC against BASE_RPC endpoints. Rotates on failure. Returns result or None."""
+    payload = json.dumps({"jsonrpc":"2.0","method":method,"params":params,"id":1}).encode()
+    last_err = None
+    for url in RPC_ENDPOINTS:
+        try:
+            req = urllib.request.Request(url, data=payload,
+                headers={"Content-Type":"application/json","User-Agent":"LPR/4"})
+            r = urllib.request.urlopen(req, timeout=timeout)
+            res = json.loads(r.read())
+            if "result" in res:
+                return res["result"]
+            last_err = res.get("error", "no result")
+        except Exception as e:
+            last_err = e
+    return None
+
+class BalancesFetcher:
+    """Fetches ETH/WETH/USDC balances for a Base-chain wallet.
+
+    Only reads from Base RPCs — can't physically see or touch other chains.
+    """
+    def __init__(self):
+        self.address = None
+        self.data = {"ETH":0.0,"WETH":0.0,"USDC":0.0,"total_usd":0.0,"ts":0,"err":None}
+    def set_address(self, addr):
+        self.address = addr
+    def fetch(self, eth_price_usd=0):
+        if not self.address:
+            self.data["err"] = "no_address"; return False
+        addr = self.address.lower()
+        addr_padded = addr[2:].rjust(64, "0") if addr.startswith("0x") else addr.rjust(64,"0")
+        try:
+            # ETH balance (18 dec)
+            eth_hex = _rpc_call("eth_getBalance", [self.address, "latest"])
+            # WETH balance (18 dec)
+            weth_hex = _rpc_call("eth_call",
+                [{"to": WETH_ADDR, "data": _BALANCE_OF_SELECTOR + addr_padded}, "latest"])
+            # USDC balance (6 dec)
+            usdc_hex = _rpc_call("eth_call",
+                [{"to": USDC_ADDR, "data": _BALANCE_OF_SELECTOR + addr_padded}, "latest"])
+            if eth_hex is None or weth_hex is None or usdc_hex is None:
+                self.data["err"] = "rpc_failed"; return False
+            eth = int(eth_hex, 16) / 1e18
+            weth = int(weth_hex, 16) / 1e18
+            usdc = int(usdc_hex, 16) / 1e6
+            total = (eth + weth) * eth_price_usd + usdc
+            self.data = {"ETH":eth,"WETH":weth,"USDC":usdc,"total_usd":total,
+                         "ts":time.time(),"err":None}
+            return True
+        except Exception as e:
+            self.data["err"] = str(e); return False
+
 class Strat:
     DEFAULT_CFG = {"name":"Default","strategy_type":"exit_pool","parameters":{"base_width_pct":15,"trend_shift":0.4,"buffer_pct":5,"exit_trend_pct":10,"enter_trend_pct":2}}
     def __init__(self,path=None):
@@ -452,6 +510,15 @@ class Term(Gtk.Box):
             else:
                 self._cached_pk = None
             self._cached_pw = None
+            # Derive wallet address for balance display (read-only, no tx).
+            try:
+                from eth_account import Account
+                self.app.wallet_address = Account.from_key(pk).address
+                self.app.balances.set_address(self.app.wallet_address)
+                # Kick off a first balance fetch in the background.
+                threading.Thread(target=self.app._fetch_balances, daemon=True).start()
+            except Exception:
+                pass
             self.wl("Password OK — ejecutando...", "blue")
             threading.Thread(target=self._exec, args=(pending_cmd,), daemon=True).start()
         else:
@@ -498,10 +565,17 @@ class Term(Gtk.Box):
                 GLib.idle_add(self.wl,"Setup requiere terminal real. Ejecuta en una terminal:","yellow")
                 GLib.idle_add(self.wl,"  lp-autobot --setup","green")
                 return
+            # Append --target-usd if the user has set a pool size target and
+            # the verb actually consumes wallet capital.
+            target_usd = self.app.config.get("target_pool_usd", 0)
+            tgt_args = []
+            if target_usd and float(target_usd) > 0 and verb in ("enter","rebalance"):
+                if "--target-usd" not in parts:
+                    tgt_args = ["--target-usd", str(float(target_usd))]
             if verb=="status":full=[sys.executable,autobot,"--status","-p",pid,"-y"]
-            elif verb=="rebalance":full=[sys.executable,autobot,"--rebalance","-p",pid,"-y"]+parts[1:]
+            elif verb=="rebalance":full=[sys.executable,autobot,"--rebalance","-p",pid,"-y"]+parts[1:]+tgt_args
             elif verb=="exit":full=[sys.executable,autobot,"--exit","-p",pid,"-y"]+parts[1:]
-            elif verb=="enter":full=[sys.executable,autobot,"--enter","-y"]+parts[1:]
+            elif verb=="enter":full=[sys.executable,autobot,"--enter","-y"]+parts[1:]+tgt_args
             else:GLib.idle_add(self.wl,f"Comando no reconocido: {verb}. Escribe help","red");return
             GLib.idle_add(self.wl,"Ejecutando...","blue")
             # Prefer passing the already-decrypted PK via FD so the password
@@ -618,6 +692,39 @@ class MainWindow(Gtk.Window):
         rb.pack_start(self.e_hi,True,True,0);b2=Gtk.Button(label="Aplicar");b2.get_style_context().add_class("btn-g")
         b2.connect("clicked",self._set_range);rb.pack_start(b2,False,False,0);c3.pack_start(rb,False,False,0)
         cfg_box.pack_start(c3,False,False,0)
+        # Balances (Base only) + pool size target
+        cbal=_card()
+        cbal.pack_start(_lbl("Activos en Base","stitle"),False,False,0)
+        self.lbl_wallet=_lbl("Desbloquea la wallet para ver saldos","sub")
+        cbal.pack_start(self.lbl_wallet,False,False,2)
+        bgrid=Gtk.Grid();bgrid.set_column_spacing(16);bgrid.set_row_spacing(4)
+        self.bal_lbls={}
+        for key,lb,col,row in [("ETH","ETH (nativo)",0,0),("WETH","WETH",1,0),("USDC","USDC",0,1),("total_usd","Total USD",1,1)]:
+            vbb=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=1)
+            vbb.pack_start(_lbl(lb,"ml"),False,False,0)
+            vv=_lbl("—","mv-sm");vbb.pack_start(vv,False,False,0)
+            self.bal_lbls[key]=vv;bgrid.attach(vbb,col,row,1,1)
+        cbal.pack_start(bgrid,False,False,4)
+        brow=Gtk.Box(spacing=8)
+        bref=Gtk.Button(label="Actualizar saldos");bref.get_style_context().add_class("btn-dim")
+        bref.connect("clicked",lambda b:threading.Thread(target=app._fetch_balances,daemon=True).start())
+        brow.pack_start(bref,False,False,0)
+        cbal.pack_start(brow,False,False,4)
+        cbal.pack_start(_lbl("Solo se leen y usan activos en Base (chain 8453). Otras redes no se tocan.","sub"),False,False,2)
+        cbal.pack_start(_lbl("Tamaño de pool (USD)","stitle"),False,False,8)
+        cbal.pack_start(_lbl("Capital que quieres desplegar en la pool. El resto se queda en la wallet.","sub"),False,False,2)
+        tb=Gtk.Box(spacing=8)
+        self.e_target=Gtk.Entry();self.e_target.set_placeholder_text("Ej: 100 (deja vacío para usar todo)")
+        self.e_target.get_style_context().add_class("entry")
+        cur_tgt=app.config.get("target_pool_usd",0)
+        self.e_target.set_text(str(cur_tgt) if cur_tgt else "")
+        tb.pack_start(self.e_target,True,True,0)
+        bsave=Gtk.Button(label="Guardar");bsave.get_style_context().add_class("btn-g")
+        bsave.connect("clicked",self._save_target);tb.pack_start(bsave,False,False,0)
+        bmax=Gtk.Button(label="Usar todo");bmax.get_style_context().add_class("btn-dim")
+        bmax.connect("clicked",self._target_max);tb.pack_start(bmax,False,False,0)
+        cbal.pack_start(tb,False,False,0)
+        cfg_box.pack_start(cbal,False,False,0)
         # Quick actions
         c4=_card();c4.pack_start(_lbl("Acciones rapidas","stitle"),False,False,0)
         c4.pack_start(_lbl("Ejecutan comandos en la terminal","sub"),False,False,4)
@@ -668,6 +775,24 @@ class MainWindow(Gtk.Window):
         apr=bt.get("mean_oos_apr_pct",bt.get("net_apr","?"))
         rb=bt.get("rebalance_count",bt.get("positive_windows","?"))
         self.lbl_sinfo.set_text(f"APR: {apr}% · {rb}")
+        # Balances panel
+        addr=self.app.wallet_address
+        bd=self.app.balances.data
+        if addr:
+            short=f"{addr[:6]}…{addr[-4:]}"
+            ts=bd.get("ts",0)
+            age=int(time.time()-ts) if ts else None
+            age_txt=f" · hace {age}s" if age is not None else ""
+            self.lbl_wallet.set_text(f"Wallet: {short}{age_txt}")
+        eth_p=self.app.fetcher.price or 0
+        def _fmt_eth(v):
+            usd=v*eth_p if eth_p else 0
+            return f"{v:.6f}" + (f"  (${usd:,.2f})" if eth_p else "")
+        self.bal_lbls["ETH"].set_text(_fmt_eth(bd.get("ETH",0)))
+        self.bal_lbls["WETH"].set_text(_fmt_eth(bd.get("WETH",0)))
+        self.bal_lbls["USDC"].set_text(f"{bd.get('USDC',0):,.2f}")
+        total=bd.get("total_usd",0)
+        self.bal_lbls["total_usd"].set_markup(f'<span foreground="#34d399">${total:,.2f}</span>')
         # Recommendation
         for c in self.rec_frame.get_children():self.rec_frame.remove(c)
         if rec:
@@ -749,6 +874,26 @@ class MainWindow(Gtk.Window):
     def _pid_fail(self):
         self.lbl_pos.set_markup(f'<span foreground="#f87171">✗ {self.app.fetcher.error}</span>')
         self.app.term.wl(f"✗ {self.app.fetcher.error}","red")
+    def _save_target(self,btn):
+        txt=self.e_target.get_text().strip().replace(",",".")
+        if not txt:
+            self.app.config.set("target_pool_usd",0)
+            self.app.term.wl("Tamaño de pool: sin límite (usa todo el saldo)","blue")
+            return
+        try:
+            v=float(txt)
+            if v<0: raise ValueError("negative")
+            self.app.config.set("target_pool_usd",v)
+            self.app.term.wl(f"Tamaño de pool objetivo: ${v:,.2f}","green")
+        except Exception:
+            self.app.term.wl("Valor inválido. Introduce un número en USD.","red")
+    def _target_max(self,btn):
+        total=self.app.balances.data.get("total_usd",0)
+        if total<=0:
+            self.app.term.wl("Primero actualiza los saldos.","yellow"); return
+        # Leave a small buffer for gas + rounding
+        v=max(0.0,total-2.0)
+        self.e_target.set_text(f"{v:.2f}")
     def _set_range(self,btn):
         try:
             lo=float(self.e_lo.get_text());hi=float(self.e_hi.get_text())
@@ -774,6 +919,7 @@ class App:
     def __init__(self):
         self.config=Cfg();self.strategy=Strat(self.config.get("strategy_file"))
         self.fetcher=Fetcher();self.history=Hist();self.stats=Stats()
+        self.balances=BalancesFetcher();self.wallet_address=None
         self.status="gray";self.last_rec=None;self.last_rec_time=0;self.window=None;self.term=None
         self.last_rec_time_by_type={}  # {action_type: unix_ts} for per-action cooldown
         self._last_fee_time=0  # Track when we last added fees
@@ -789,6 +935,7 @@ class App:
             menu.show_all();self.ind.set_menu(menu)
         else:self.ind=None
         GLib.timeout_add_seconds(2,self._init);GLib.timeout_add_seconds(300,self._poll);GLib.timeout_add_seconds(900,self._poll_pos)
+        GLib.timeout_add_seconds(120,self._poll_balances)
     def _open(self,*a):
         if not self.window:self.window=MainWindow(self)
         self.window.show_all();self.window.present()
@@ -813,6 +960,13 @@ class App:
         pid=self.config.get("position_id")
         if pid:threading.Thread(target=self._fpos,args=(pid,),daemon=True).start()
         return True
+    def _poll_balances(self):
+        if self.wallet_address:
+            threading.Thread(target=self._fetch_balances,daemon=True).start()
+        return True
+    def _fetch_balances(self):
+        self.balances.fetch(eth_price_usd=self.fetcher.price or 0)
+        GLib.idle_add(self._update_win)
     def _fpos(self,pid):
         self.fetcher.fetch_position(pid)
         if self.fetcher.pos:GLib.idle_add(self._apos)
@@ -916,10 +1070,13 @@ class App:
 
         def execute():
             try:
+                target_usd = self.config.get("target_pool_usd", 0)
+                tgt_args = (["--target-usd", str(float(target_usd))]
+                            if target_usd and float(target_usd) > 0 else [])
                 if rtype == "rebalance":
                     lo = rec.get("lo",0); hi = rec.get("hi",0)
                     cmd = [sys.executable, autobot, "--rebalance", "-p", pid, "-y",
-                           "--price-lower", str(int(lo)), "--price-upper", str(int(hi))]
+                           "--price-lower", str(int(lo)), "--price-upper", str(int(hi))] + tgt_args
                     GLib.idle_add(self.term.wl, f"  Rebalanceando a ${lo:.0f}-${hi:.0f}...", "blue")
 
                 elif rtype == "exit_pool":
@@ -930,7 +1087,7 @@ class App:
                 elif rtype == "enter_pool":
                     lo = rec.get("lo",0); hi = rec.get("hi",0)
                     cmd = [sys.executable, autobot, "--enter", "-y",
-                           "--price-lower", str(int(lo)), "--price-upper", str(int(hi))]
+                           "--price-lower", str(int(lo)), "--price-upper", str(int(hi))] + tgt_args
                     GLib.idle_add(self.term.wl, f"  Abriendo pool ${lo:.0f}-${hi:.0f}...", "blue")
                 else:
                     GLib.idle_add(self.term.wl, f"  Tipo desconocido: {rtype}", "red")

@@ -1075,7 +1075,7 @@ class TxBuilder:
             "ratio": ratio,
         }
 
-    def rebalance(self, old_token_id, new_tick_lower, new_tick_upper, fee=500, dry_run=False, auto_confirm=False):
+    def rebalance(self, old_token_id, new_tick_lower, new_tick_upper, fee=500, dry_run=False, auto_confirm=False, target_usd=None):
         """Full rebalance: close old position → swap to ratio → open new position."""
         print(f"\n{'='*50}")
         print(f"REBALANCE: Position {old_token_id}")
@@ -1135,28 +1135,37 @@ class TxBuilder:
         # Rough 50/50 USD split. For out-of-range positions you would
         # want a skewed ratio; this is left as a follow-up (the pool will
         # consume whatever it needs — our slippage bounds cap the risk).
-        target_weth_val = total_usd * 0.5 / pool_price
+        deploy_usd = total_usd
+        if target_usd and target_usd > 0 and target_usd < total_usd * 0.99:
+            deploy_usd = target_usd
+            print(f"  Target position size: ${deploy_usd:,.2f} (of ${total_usd:,.2f} available)")
+        target_weth_val = deploy_usd * 0.5 / pool_price
+        target_usdc_val = deploy_usd * 0.5
 
         if weth_val > target_weth_val * 1.05:
-            # Too much WETH, swap some to USDC
+            # Too much WETH, swap excess to USDC
             swap_amount = int((weth_val - target_weth_val) * 1e18)
             if swap_amount > 0:
                 print(f"  Swapping {swap_amount/1e18:.6f} WETH → USDC...")
                 results["swap"] = self.swap_exact_input(WETH, USDC, swap_amount, fee)
-        elif usdc_val > (total_usd * 0.5) * 1.05:
-            # Too much USDC, swap some to WETH
-            swap_amount = int((usdc_val - total_usd * 0.5) * 1e6)
+        elif usdc_val > target_usdc_val * 1.05:
+            # Too much USDC, swap excess to WETH
+            swap_amount = int((usdc_val - target_usdc_val) * 1e6)
             if swap_amount > 0:
                 print(f"  Swapping {swap_amount/1e6:.2f} USDC → WETH...")
                 results["swap"] = self.swap_exact_input(USDC, WETH, swap_amount, fee)
-        
+
         time.sleep(2)
-        
-        # Step 3: Open new position with all available tokens
+
+        # Step 3: Open new position. Cap at target if set; excess stays in wallet.
         print(f"\n  [3/3] Opening new position...")
         balances = self.get_balances()
-        weth_amount = int(balances["WETH"] * 0.99 * 1e18)  # Leave 1% buffer
-        usdc_amount = int(balances["USDC"] * 0.99 * 1e6)
+        if target_usd and target_usd > 0 and target_usd < total_usd * 0.99:
+            weth_amount = int(min(balances["WETH"], target_weth_val) * 1e18)
+            usdc_amount = int(min(balances["USDC"], target_usdc_val) * 1e6)
+        else:
+            weth_amount = int(balances["WETH"] * 0.99 * 1e18)  # Leave 1% buffer
+            usdc_amount = int(balances["USDC"] * 0.99 * 1e6)
         
         if weth_amount > 0 or usdc_amount > 0:
             results["open"] = self.open_position(
@@ -1210,53 +1219,86 @@ class TxBuilder:
         print(f"  Balances: {balances['WETH']:.6f} WETH, {balances['USDC']:.2f} USDC")
         return results
     
-    def enter_pool(self, tick_lower, tick_upper, fee=500, dry_run=False, auto_confirm=False):
-        """Enter pool: swap to 50/50 ratio → open new position."""
+    def enter_pool(self, tick_lower, tick_upper, fee=500, dry_run=False, auto_confirm=False, target_usd=None):
+        """Enter pool: swap to 50/50 ratio → open new position.
+
+        If ``target_usd`` is set and > 0, the position size is capped to that
+        USD value; excess stays in the wallet. Otherwise uses ~all available.
+        """
         print(f"\n{'='*50}")
         print(f"ENTER POOL: New range ticks {tick_lower}/{tick_upper}")
         lo = tick_to_price(tick_lower); hi = tick_to_price(tick_upper)
         print(f"  Range: ${lo:,.0f} — ${hi:,.0f}")
+        if target_usd and target_usd > 0:
+            print(f"  Target position size: ${target_usd:,.2f}")
         print(f"{'='*50}")
-        
+
         if dry_run:
             print(f"  🔍 DRY RUN — would open new position")
             return {"status": "dry_run"}
-        
+
         ok, eth_bal = self.check_gas(0.0002)
         if not ok:
             return {"status": "insufficient_gas", "eth_balance": eth_bal}
         self._reset_nonce()
-        
+
         confirm = "y" if auto_confirm else input("  Open new position? [y/N]: ").strip().lower()
         if confirm != 'y':
             print("  Cancelled."); return {"status": "cancelled"}
-        
-        # Swap to ~50/50 ratio
+
+        pool_price = self.get_pool_price_usdc_per_eth(fee)
         balances = self.get_balances()
-        # Rough: get current ETH price
-        total_weth_val = balances["WETH"]
-        total_usdc_val = balances["USDC"]
-        
-        # We need both tokens for the position
-        if total_weth_val > 0 and total_usdc_val < 1:
-            # All in WETH, swap half to USDC
-            swap_amt = int(total_weth_val * 0.49 * 1e18)
-            print(f"  Swapping {swap_amt/1e18:.6f} WETH → USDC...")
-            self.swap_exact_input(WETH, USDC, swap_amt, fee)
-            time.sleep(2)
-        elif total_usdc_val > 1 and total_weth_val < 0.0001:
-            # All in USDC, swap half to WETH
-            swap_amt = int(total_usdc_val * 0.49 * 1e6)
-            print(f"  Swapping {swap_amt/1e6:.2f} USDC → WETH...")
-            self.swap_exact_input(USDC, WETH, swap_amt, fee)
-            time.sleep(2)
-        
-        balances = self.get_balances()
-        weth_amount = int(balances["WETH"] * 0.99 * 1e18)
-        usdc_amount = int(balances["USDC"] * 0.99 * 1e6)
-        
+        weth_val = balances["WETH"]; usdc_val = balances["USDC"]
+        wallet_usd = weth_val * pool_price + usdc_val
+        print(f"  Wallet: {weth_val:.6f} WETH + {usdc_val:.2f} USDC ≈ ${wallet_usd:,.2f}")
+
+        if target_usd and target_usd > 0:
+            # Cap target to what we actually hold (minus 1% safety).
+            usable = wallet_usd * 0.99
+            if target_usd > usable:
+                print(f"  ⚠ target ${target_usd:,.2f} > wallet usable ${usable:,.2f}. Clamping.")
+                target_usd = usable
+            half_usd = target_usd / 2.0
+            target_weth = half_usd / pool_price
+            target_usdc = half_usd
+            # Swap only the deficit on whichever side is short.
+            if weth_val < target_weth * 0.999:
+                need_weth_usd = (target_weth - weth_val) * pool_price
+                swap_usdc = need_weth_usd * 1.005  # small buffer
+                swap_usdc = min(swap_usdc, max(0.0, usdc_val - target_usdc))
+                if swap_usdc > 0.5:
+                    print(f"  Swapping {swap_usdc:.2f} USDC → WETH (to hit target)...")
+                    self.swap_exact_input(USDC, WETH, int(swap_usdc * 1e6), fee)
+                    time.sleep(2)
+            elif usdc_val < target_usdc * 0.999:
+                need_usdc = target_usdc - usdc_val
+                swap_weth = (need_usdc / pool_price) * 1.005
+                swap_weth = min(swap_weth, max(0.0, weth_val - target_weth))
+                if swap_weth > 0.00001:
+                    print(f"  Swapping {swap_weth:.6f} WETH → USDC (to hit target)...")
+                    self.swap_exact_input(WETH, USDC, int(swap_weth * 1e18), fee)
+                    time.sleep(2)
+            balances = self.get_balances()
+            weth_amount = int(min(balances["WETH"], target_weth) * 1e18)
+            usdc_amount = int(min(balances["USDC"], target_usdc) * 1e6)
+        else:
+            # No target: existing behaviour — swap half of the dominant side.
+            if weth_val > 0 and usdc_val < 1:
+                swap_amt = int(weth_val * 0.49 * 1e18)
+                print(f"  Swapping {swap_amt/1e18:.6f} WETH → USDC...")
+                self.swap_exact_input(WETH, USDC, swap_amt, fee)
+                time.sleep(2)
+            elif usdc_val > 1 and weth_val < 0.0001:
+                swap_amt = int(usdc_val * 0.49 * 1e6)
+                print(f"  Swapping {swap_amt/1e6:.2f} USDC → WETH...")
+                self.swap_exact_input(USDC, WETH, swap_amt, fee)
+                time.sleep(2)
+            balances = self.get_balances()
+            weth_amount = int(balances["WETH"] * 0.99 * 1e18)
+            usdc_amount = int(balances["USDC"] * 0.99 * 1e6)
+
         result = self.open_position(tick_lower, tick_upper, weth_amount, usdc_amount, fee)
-        
+
         print(f"\n  ✅ Position opened!")
         return result
 
@@ -1322,6 +1364,8 @@ def main():
     parser.add_argument("--price-lower", type=float, help="Lower price (converts to tick)")
     parser.add_argument("--price-upper", type=float, help="Upper price (converts to tick)")
     parser.add_argument("--fee", type=int, default=500, help="Pool fee tier (default: 500 = 0.05%%)")
+    parser.add_argument("--target-usd", type=float, default=None,
+                        help="Cap position size to this USD value; excess stays in wallet")
     parser.add_argument("--dry-run", action="store_true", help="Simulate without executing")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompts")
     parser.add_argument(
@@ -1394,7 +1438,7 @@ def main():
             print("ERROR: --position-id required"); return
         if not args.tick_lower or not args.tick_upper:
             print("ERROR: --tick-lower and --tick-upper (or --price-lower/--price-upper) required"); return
-        bot.rebalance(args.position_id, args.tick_lower, args.tick_upper, args.fee, args.dry_run, args.yes)
+        bot.rebalance(args.position_id, args.tick_lower, args.tick_upper, args.fee, args.dry_run, args.yes, args.target_usd)
     
     elif args.exit:
         if not args.position_id:
@@ -1404,7 +1448,7 @@ def main():
     elif args.enter:
         if not args.tick_lower or not args.tick_upper:
             print("ERROR: --tick-lower and --tick-upper (or --price-lower/--price-upper) required"); return
-        bot.enter_pool(args.tick_lower, args.tick_upper, args.fee, args.dry_run, args.yes)
+        bot.enter_pool(args.tick_lower, args.tick_upper, args.fee, args.dry_run, args.yes, args.target_usd)
 
     elif args.compound:
         if not args.position_id:
