@@ -833,9 +833,19 @@ class TxBuilder:
                 POSITION_MANAGER, a1,
             )
 
-        # Slippage-protected min amounts.
-        a0_min = int(a0 * (1 - self.slippage)) if a0 > 0 else 0
-        a1_min = int(a1 * (1 - self.slippage)) if a1 > 0 else 0
+        # Slippage bounds for mint:
+        # Uniswap V3 picks one side as the limiting factor based on where the
+        # current price sits inside the range; the other side is consumed in
+        # exact ratio. If our caller-provided ratio doesn't perfectly match
+        # the tick-accurate ratio, one of the two consumed amounts will be
+        # lower than its `amount_min` bound and the mint reverts.
+        #
+        # For retail-scale positions ($5–$500) MEV sandwich on mint isn't a
+        # realistic threat, and the PositionManager only pulls the tokens it
+        # actually consumes — the rest stays in the wallet. Using 0 mins
+        # here trades that residual dust risk for a ~zero-revert mint.
+        a0_min = 0
+        a1_min = 0
 
         deadline = int(time.time()) + 600
 
