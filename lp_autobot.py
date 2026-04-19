@@ -72,6 +72,15 @@ FACTORY = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
 WETH = "0x4200000000000000000000000000000000000006"
 USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
+# Gas reserve: extra ETH we keep in the wallet beyond the cost of the current
+# operation so we don't run dry. ~0.002 ETH covers ~20 txs on Base at normal
+# gas prices, which is plenty of headroom for a few days of unattended runs.
+GAS_RESERVE_ETH = float(os.environ.get("LP_GAS_RESERVE_ETH", "0.002"))
+
+# Compound-fees default: only collect+redeposit when estimated gas is at
+# most this fraction of the fees we'd reinvest. 0.01 = 1%.
+DEFAULT_COMPOUND_RATIO = float(os.environ.get("LP_COMPOUND_RATIO", "0.01"))
+
 # ABI fragments (only what we need)
 ERC20_ABI = json.loads('[{"constant":true,"inputs":[{"name":"","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},{"constant":true,"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}]')
 
@@ -79,6 +88,7 @@ POSITION_MANAGER_ABI = json.loads('''[
   {"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"positions","outputs":[{"internalType":"uint96","name":"nonce","type":"uint96"},{"internalType":"address","name":"operator","type":"address"},{"internalType":"address","name":"token0","type":"address"},{"internalType":"address","name":"token1","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickLower","type":"int24"},{"internalType":"int24","name":"tickUpper","type":"int24"},{"internalType":"uint128","name":"liquidity","type":"uint128"},{"internalType":"uint256","name":"feeGrowthInside0LastX128","type":"uint256"},{"internalType":"uint256","name":"feeGrowthInside1LastX128","type":"uint256"},{"internalType":"uint128","name":"tokensOwed0","type":"uint128"},{"internalType":"uint128","name":"tokensOwed1","type":"uint128"}],"stateMutability":"view","type":"function"},
   {"inputs":[{"components":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"uint128","name":"liquidity","type":"uint128"},{"internalType":"uint256","name":"amount0Min","type":"uint256"},{"internalType":"uint256","name":"amount1Min","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"internalType":"struct INonfungiblePositionManager.DecreaseLiquidityParams","name":"params","type":"tuple"}],"name":"decreaseLiquidity","outputs":[{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"payable","type":"function"},
   {"inputs":[{"components":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint128","name":"amount0Max","type":"uint128"},{"internalType":"uint128","name":"amount1Max","type":"uint128"}],"internalType":"struct INonfungiblePositionManager.CollectParams","name":"params","type":"tuple"}],"name":"collect","outputs":[{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"payable","type":"function"},
+  {"inputs":[{"components":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"uint256","name":"amount0Desired","type":"uint256"},{"internalType":"uint256","name":"amount1Desired","type":"uint256"},{"internalType":"uint256","name":"amount0Min","type":"uint256"},{"internalType":"uint256","name":"amount1Min","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"internalType":"struct INonfungiblePositionManager.IncreaseLiquidityParams","name":"params","type":"tuple"}],"name":"increaseLiquidity","outputs":[{"internalType":"uint128","name":"liquidity","type":"uint128"},{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"payable","type":"function"},
   {"inputs":[{"components":[{"internalType":"address","name":"token0","type":"address"},{"internalType":"address","name":"token1","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickLower","type":"int24"},{"internalType":"int24","name":"tickUpper","type":"int24"},{"internalType":"uint256","name":"amount0Desired","type":"uint256"},{"internalType":"uint256","name":"amount1Desired","type":"uint256"},{"internalType":"uint256","name":"amount0Min","type":"uint256"},{"internalType":"uint256","name":"amount1Min","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"internalType":"struct INonfungiblePositionManager.MintParams","name":"params","type":"tuple"}],"name":"mint","outputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"uint128","name":"liquidity","type":"uint128"},{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"payable","type":"function"},
   {"inputs":[{"internalType":"bytes[]","name":"data","type":"bytes[]"}],"name":"multicall","outputs":[{"internalType":"bytes[]","name":"results","type":"bytes[]"}],"stateMutability":"payable","type":"function"}
 ]''')
@@ -491,13 +501,23 @@ class TxBuilder:
         print(f"  ✓ {label} (tx: {tx_hash.hex()[:16]}...)")
         return tx_hash, receipt
     
-    def check_gas(self, min_eth=0.0001):
-        """Check if wallet has enough ETH for gas. Returns (ok, balance)."""
+    def check_gas(self, min_eth=0.0001, reserve_eth=None):
+        """Check if wallet has enough ETH for gas. Returns (ok, balance).
+
+        `min_eth` is the estimated cost of the current operation.
+        `reserve_eth` is an extra buffer we keep for FUTURE txs so we never
+        run the wallet down to empty. Defaults to GAS_RESERVE_ETH (~20 txs
+        on Base at normal gas). Set to 0 to bypass the reserve check.
+        """
+        if reserve_eth is None:
+            reserve_eth = GAS_RESERVE_ETH
+        required = min_eth + reserve_eth
         bal = self.w3.eth.get_balance(self.address) / 1e18
-        ok = bal >= min_eth
+        ok = bal >= required
         if not ok:
-            print(f"  ⚠️  ETH balance too low for gas: {bal:.6f} ETH (need ~{min_eth})")
-            print(f"  Send at least ${min_eth * 2400:.2f} in ETH to {self.address}")
+            print(f"  ⚠️  ETH balance too low: {bal:.6f} ETH "
+                  f"(need {min_eth:.6f} op + {reserve_eth:.6f} reserve = {required:.6f})")
+            print(f"  Send at least ${required * 2400:.2f} in ETH to {self.address}")
         return ok, bal
     
     def get_balances(self):
@@ -798,7 +818,197 @@ class TxBuilder:
 
         print(f"  tokenId: {new_token_id}")
         return {"tx": tx_hash.hex(), "token_id": new_token_id}
-    
+
+    def read_uncollected_fees(self, token_id, fee=500):
+        """Return (weth_fee, usdc_fee, price_usdc_per_eth) for the position.
+
+        Uses a static `collect` call with amount*Max = 2^128-1 — this is the
+        canonical Uniswap pattern for reading true collectable fees (the
+        on-chain `tokensOwed*` fields only update on pokes).
+        """
+        from web3 import Web3
+        MAX_UINT128 = 2**128 - 1
+        try:
+            amount0, amount1 = self.pm.functions.collect((
+                token_id, self.address, MAX_UINT128, MAX_UINT128,
+            )).call({"from": self.address})
+        except Exception as e:
+            print(f"  ⚠️  could not read uncollected fees ({e})")
+            return 0.0, 0.0, 0.0
+        pool_t0, _ = self._pool_token_order(fee)
+        weth_cs = Web3.to_checksum_address(WETH)
+        if pool_t0.lower() == weth_cs.lower():
+            weth_fee, usdc_fee = amount0 / 1e18, amount1 / 1e6
+        else:
+            weth_fee, usdc_fee = amount1 / 1e18, amount0 / 1e6
+        price = self.get_pool_price_usdc_per_eth(fee)
+        return weth_fee, usdc_fee, price
+
+    def compound_fees(self, token_id, fee=500, gas_ratio_max=DEFAULT_COMPOUND_RATIO,
+                     dry_run=False, auto_confirm=False):
+        """Collect pending fees and redeposit them into the same position.
+
+        Only fires when estimated gas cost is ≤ `gas_ratio_max` of the
+        fees to reinvest (default 1%). This is how the GUI/daemon trigger
+        opportunistic compounding without bleeding gas on tiny claims.
+
+        Returns a dict with `status` ∈ {ok, skipped_gas_ratio, no_fees,
+        no_position, insufficient_gas, cancelled, dry_run, fee_read_failed}.
+        """
+        from web3 import Web3
+
+        print(f"\n{'='*50}")
+        print(f"COMPOUND: Position {token_id}")
+        print(f"{'='*50}")
+
+        pos = get_position(token_id)
+        if not pos or pos["liquidity"] == 0:
+            print("  No active liquidity — skipping.")
+            return {"status": "no_position"}
+
+        weth_fee, usdc_fee, price = self.read_uncollected_fees(token_id, fee)
+        if price <= 0:
+            return {"status": "fee_read_failed"}
+        fees_usd = weth_fee * price + usdc_fee
+
+        gas_price = self._gas_price()
+        # collect (~150k) + increaseLiquidity (~250k). Add one swap (~120k) for
+        # the rebalance-to-ratio step when the fees are lopsided.
+        est_gas_units = 520_000
+        gas_cost_eth = est_gas_units * gas_price / 1e18
+        gas_cost_usd = gas_cost_eth * price
+        ratio = (gas_cost_usd / fees_usd) if fees_usd > 0 else float("inf")
+
+        print(f"  Uncollected: {weth_fee:.6f} WETH + {usdc_fee:.4f} USDC ≈ ${fees_usd:.2f}")
+        print(f"  Est. gas:    {gas_cost_eth:.6f} ETH ≈ ${gas_cost_usd:.3f}")
+        print(f"  Ratio:       {ratio*100:.2f}% (threshold {gas_ratio_max*100:.1f}%)")
+
+        if fees_usd <= 0:
+            print("  No fees to compound.")
+            return {"status": "no_fees", "fees_usd": 0.0}
+        if ratio > gas_ratio_max:
+            print("  Skipping — gas too high relative to fees.")
+            return {"status": "skipped_gas_ratio",
+                    "fees_usd": fees_usd, "gas_usd": gas_cost_usd, "ratio": ratio}
+
+        if dry_run:
+            print("  🔍 DRY RUN — would collect and redeposit.")
+            return {"status": "dry_run", "fees_usd": fees_usd,
+                    "gas_usd": gas_cost_usd, "ratio": ratio}
+
+        ok, eth_bal = self.check_gas(min_eth=gas_cost_eth * 1.3)
+        if not ok:
+            return {"status": "insufficient_gas", "eth_balance": eth_bal}
+
+        confirm = "y" if auto_confirm else input(
+            f"  Compound ${fees_usd:.2f} for ${gas_cost_usd:.3f} gas? [y/N]: "
+        ).strip().lower()
+        if confirm != 'y':
+            return {"status": "cancelled"}
+
+        self._reset_nonce()
+
+        # Step 1: collect fees to wallet.
+        MAX_UINT128 = 2**128 - 1
+        tx1 = self.pm.functions.collect((
+            token_id, self.address, MAX_UINT128, MAX_UINT128,
+        )).build_transaction({
+            'from': self.address, 'nonce': self._get_nonce(),
+            'gas': 200000, 'gasPrice': gas_price,
+            'chainId': CHAIN_ID, 'value': 0,
+        })
+        tx_hash1, _ = self._send_and_wait(tx1, "fees collected")
+        time.sleep(2)
+
+        # Step 2: balance the collected tokens to the pool's current ratio
+        # so increaseLiquidity can consume (almost) all of them. We don't
+        # need a perfect split — the PM just returns the leftover dust.
+        pool_t0, pool_t1 = self._pool_token_order(fee)
+        weth_cs = Web3.to_checksum_address(WETH)
+        bals = self.get_balances()
+        weth_raw = int(bals["WETH"] * 1e18)
+        usdc_raw = int(bals["USDC"] * 1e6)
+
+        # Skip rebalancing if one side is negligible (< $0.10 worth).
+        weth_usd = bals["WETH"] * price
+        usdc_usd = bals["USDC"]
+        total_usd = weth_usd + usdc_usd
+        if total_usd > 0 and abs(weth_usd - usdc_usd) / total_usd > 0.15:
+            # Swap the heavier side down to 50/50.
+            target_weth_usd = total_usd / 2
+            if weth_usd > target_weth_usd:
+                excess_usd = weth_usd - target_weth_usd
+                swap_in_raw = int(excess_usd / price * 1e18)
+                if swap_in_raw > 0:
+                    try:
+                        self.swap_exact_input(WETH, USDC, swap_in_raw, fee)
+                        time.sleep(2)
+                    except Exception as e:
+                        print(f"  ⚠️  ratio swap failed ({e}); continuing with current balances")
+            else:
+                excess_usd = usdc_usd - target_weth_usd
+                swap_in_raw = int(excess_usd * 1e6)
+                if swap_in_raw > 0:
+                    try:
+                        self.swap_exact_input(USDC, WETH, swap_in_raw, fee)
+                        time.sleep(2)
+                    except Exception as e:
+                        print(f"  ⚠️  ratio swap failed ({e}); continuing with current balances")
+            bals = self.get_balances()
+            weth_raw = int(bals["WETH"] * 1e18)
+            usdc_raw = int(bals["USDC"] * 1e6)
+
+        if pool_t0.lower() == weth_cs.lower():
+            a0, a1 = weth_raw, usdc_raw
+        else:
+            a0, a1 = usdc_raw, weth_raw
+
+        if a0 == 0 and a1 == 0:
+            print("  Nothing to redeposit.")
+            return {"status": "no_fees_collected"}
+
+        if a0 > 0:
+            self.ensure_approval(
+                self.w3.eth.contract(address=Web3.to_checksum_address(pool_t0), abi=ERC20_ABI),
+                POSITION_MANAGER, a0,
+            )
+        if a1 > 0:
+            self.ensure_approval(
+                self.w3.eth.contract(address=Web3.to_checksum_address(pool_t1), abi=ERC20_ABI),
+                POSITION_MANAGER, a1,
+            )
+
+        deadline = int(time.time()) + 600
+        a0_min = int(a0 * (1 - self.slippage)) if a0 > 0 else 0
+        a1_min = int(a1 * (1 - self.slippage)) if a1 > 0 else 0
+
+        tx2 = self.pm.functions.increaseLiquidity((
+            token_id, a0, a1, a0_min, a1_min, deadline,
+        )).build_transaction({
+            'from': self.address, 'nonce': self._get_nonce(),
+            'gas': 350000, 'gasPrice': gas_price,
+            'chainId': CHAIN_ID, 'value': 0,
+        })
+        tx_hash2, _ = self._send_and_wait(tx2, "liquidity increased", timeout=240)
+
+        # Revoke any remaining allowances.
+        for tok in (pool_t0, pool_t1):
+            try:
+                tc = self.w3.eth.contract(address=Web3.to_checksum_address(tok), abi=ERC20_ABI)
+                self.revoke_approval(tc, POSITION_MANAGER)
+            except Exception:
+                pass
+
+        print(f"  ✓ Compounded ${fees_usd:.2f} into position {token_id}")
+        return {
+            "status": "ok",
+            "collect_tx": tx_hash1.hex(),
+            "increase_tx": tx_hash2.hex(),
+            "fees_usd": fees_usd,
+            "gas_usd": gas_cost_usd,
+            "ratio": ratio,
+        }
+
     def rebalance(self, old_token_id, new_tick_lower, new_tick_upper, fee=500, dry_run=False, auto_confirm=False):
         """Full rebalance: close old position → swap to ratio → open new position."""
         print(f"\n{'='*50}")
@@ -1035,6 +1245,10 @@ def main():
     parser.add_argument("--rebalance", action="store_true", help="Rebalance to new range")
     parser.add_argument("--exit", action="store_true", help="Exit pool")
     parser.add_argument("--enter", action="store_true", help="Enter pool")
+    parser.add_argument("--compound", action="store_true",
+                        help="Collect pending fees and redeposit (only if gas <= --compound-ratio of fees)")
+    parser.add_argument("--compound-ratio", type=float, default=DEFAULT_COMPOUND_RATIO,
+                        help=f"Max gas/fees ratio for --compound (default: {DEFAULT_COMPOUND_RATIO})")
     parser.add_argument("--hold", choices=["ETH","USDC"], default="USDC", help="Asset to hold on exit")
     parser.add_argument("--position-id", "-p", type=int, help="Position NFT ID")
     parser.add_argument("--tick-lower", type=int, help="Lower tick for new range")
@@ -1125,7 +1339,13 @@ def main():
         if not args.tick_lower or not args.tick_upper:
             print("ERROR: --tick-lower and --tick-upper (or --price-lower/--price-upper) required"); return
         bot.enter_pool(args.tick_lower, args.tick_upper, args.fee, args.dry_run, args.yes)
-    
+
+    elif args.compound:
+        if not args.position_id:
+            print("ERROR: --position-id required"); return
+        bot.compound_fees(args.position_id, args.fee, args.compound_ratio,
+                          args.dry_run, args.yes)
+
     else:
         parser.print_help()
 

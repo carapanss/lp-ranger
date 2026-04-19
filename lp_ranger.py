@@ -744,6 +744,8 @@ class App:
         self.status="gray";self.last_rec=None;self.last_rec_time=0;self.window=None;self.term=None
         self.last_rec_time_by_type={}  # {action_type: unix_ts} for per-action cooldown
         self._last_fee_time=0  # Track when we last added fees
+        self._last_compound_try=0  # Track last opportunistic compound attempt
+        self._compound_in_flight=False
         if AppIndicator3:
             self.ind=AppIndicator3.Indicator.new("lp-ranger",str(ICONS_DIR/"gray.png"),AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
             self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
@@ -823,6 +825,15 @@ class App:
                 # AUTO-EXECUTE if credentials are cached (prefer derived PK)
                 if self.term and (self.term._cached_pk or self.term._cached_pw):
                     self._auto_execute(rec, det)
+        # Opportunistic compound: when in-range and no pending action, try once
+        # per hour to reinvest fees — lp_autobot only fires the tx when the gas
+        # cost is <= 1% of the uncollected fees, so tiny claims are skipped.
+        if (not rec and status in ("green","yellow") and self.term
+                and (self.term._cached_pk or self.term._cached_pw)
+                and not self._compound_in_flight
+                and time.time()-self._last_compound_try>=3600):
+            self._last_compound_try=time.time()
+            threading.Thread(target=self._auto_compound,daemon=True).start()
         imap={"green":"green","yellow":"yellow","red":"red","exit_eth":"red","exit_usdc":"red","closed_eth":"yellow","closed_usdc":"yellow","gray":"gray"}
         if self.ind:
             ip=str(ICONS_DIR/f"{imap.get(status,'gray')}.png")
@@ -832,6 +843,29 @@ class App:
             try:subprocess.run(["notify-send","-i",str(ICONS_DIR/f"{imap.get(status,'gray')}_48.png"),f"LP Ranger — {t.get(status,'')}",det.get("message","")],check=False,timeout=5)
             except:pass
         self._update_win()
+
+    def _auto_compound(self):
+        """Try to compound fees if gas <= 1% of fees. Safe to call hourly —
+        the autobot itself gates on the ratio and is a no-op otherwise."""
+        pid=self.config.get("position_id","")
+        if not pid: return
+        self._compound_in_flight=True
+        try:
+            autobot=str(APP_DIR/"lp_autobot.py")
+            cmd=[sys.executable,autobot,"--compound","-p",pid,"-y"]
+            pk=self.term._cached_pk; pw=self.term._cached_pw
+            r=_run_autobot(cmd,password=pw,pk=pk)
+            out=(r.stdout or "")+(r.stderr or "")
+            if "Compounded $" in out:
+                for line in out.split("\n"):
+                    if "Compounded $" in line or "Uncollected:" in line:
+                        GLib.idle_add(self.term.wl,line.strip(),"green")
+            elif "Skipping" in out or "skipped_gas_ratio" in out:
+                pass  # quiet: expected when fees are too small yet
+        except Exception as e:
+            GLib.idle_add(self.term.wl,f"compound error: {e}","red")
+        finally:
+            self._compound_in_flight=False
 
     def _auto_execute(self, rec, det):
         """Auto-execute a signal via lp_autobot."""
