@@ -839,6 +839,22 @@ class MainWindow(Gtk.Window):
             self.mp[key]=vv;gp.attach(vb2,col,row,1,1)
         cp.pack_start(gp,False,False,0)
         self.dash_box.pack_start(cp,False,False,0)
+        # Backtest projection card: APR from walk-forward OOS + 1-year
+        # autocompounded projection of the current pool USD.
+        cproj=_card()
+        cproj.pack_start(_lbl("Proyección (backtest)","stitle"),False,False,0)
+        cproj.pack_start(_lbl("APR walk-forward OOS del último año — capitalización diaria","sub"),False,False,2)
+        gproj=Gtk.Grid();gproj.set_column_spacing(16);gproj.set_row_spacing(10);self.mproj={}
+        for key,lb,col,row in [
+            ("bt_apr","APR esperada (OOS)",0,0),
+            ("bt_fv1y","Valor estimado a 1 año",1,0),
+        ]:
+            vb3=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=2)
+            vb3.pack_start(_lbl(lb,"ml"),False,False,0)
+            vv=_lbl("—","mv-sm");vb3.pack_start(vv,False,False,0)
+            self.mproj[key]=vv;gproj.attach(vb3,col,row,1,1)
+        cproj.pack_start(gproj,False,False,0)
+        self.dash_box.pack_start(cproj,False,False,0)
         self.rec_frame=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=6);self.rec_frame.set_no_show_all(True)
         self.dash_box.pack_start(self.rec_frame,False,False,0)
         sc1=Gtk.ScrolledWindow();sc1.set_policy(Gtk.PolicyType.NEVER,Gtk.PolicyType.AUTOMATIC);sc1.add(self.dash_box)
@@ -971,6 +987,35 @@ class MainWindow(Gtk.Window):
         apr=bt.get("mean_oos_apr_pct",bt.get("net_apr","?"))
         rb=bt.get("rebalance_count",bt.get("positive_windows","?"))
         self.lbl_sinfo.set_text(f"APR: {apr}% · {rb}")
+        # Projection card: APR + 1-year compounded future value of the pool.
+        apr_num=None
+        try: apr_num=float(apr)
+        except Exception: apr_num=None
+        if apr_num is None:
+            self.mproj["bt_apr"].set_markup('<span foreground="#6b7280">sin backtest</span>')
+            self.mproj["bt_fv1y"].set_markup('<span foreground="#6b7280">—</span>')
+        else:
+            self.mproj["bt_apr"].set_markup(
+                f'<span foreground="#34d399"><b>{apr_num:.1f}%</b></span>')
+            pos=self.app.fetcher.pos
+            pool_active=stats.get("pool_active",True)
+            cur_usd=0.0
+            if pool_active and pos and pos.get("liq",0)>0 and "tick_lo" in pos and price>0:
+                cur_usd,_,_=position_value_usd(pos["liq"],pos["tick_lo"],pos["tick_hi"],price)
+            if cur_usd>0:
+                # Daily-compounded projection of the current pool value using
+                # the walk-forward OOS net APR. The backtest itself already
+                # compounds within each 30d test window (fees reinvested on
+                # rebalance); this extrapolates that monthly growth to 1y.
+                daily_r=apr_num/100.0/365.0
+                fv=cur_usd*((1.0+daily_r)**365)
+                mult=fv/cur_usd
+                self.mproj["bt_fv1y"].set_markup(
+                    f'<span foreground="#60a5fa"><b>${fv:,.2f}</b></span> '
+                    f'<span foreground="#6b7280">({mult:.1f}× de ${cur_usd:,.2f})</span>')
+            else:
+                self.mproj["bt_fv1y"].set_markup(
+                    '<span foreground="#6b7280">abre una pool para estimar</span>')
         # Balances panel
         addr=self.app.wallet_address
         bd=self.app.balances.data
