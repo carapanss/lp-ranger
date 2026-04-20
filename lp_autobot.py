@@ -73,9 +73,9 @@ WETH = "0x4200000000000000000000000000000000000006"
 USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
 # Gas reserve: extra ETH we keep in the wallet beyond the cost of the current
-# operation so we don't run dry. ~0.002 ETH covers ~20 txs on Base at normal
-# gas prices, which is plenty of headroom for a few days of unattended runs.
-GAS_RESERVE_ETH = float(os.environ.get("LP_GAS_RESERVE_ETH", "0.002"))
+# operation so we don't run dry. 0.001 ETH (~$2–3) covers ~10 txs on Base at
+# normal gas prices — enough headroom without locking up meaningful capital.
+GAS_RESERVE_ETH = float(os.environ.get("LP_GAS_RESERVE_ETH", "0.001"))
 
 # Compound-fees default: only collect+redeposit when estimated gas is at
 # most this fraction of the fees we'd reinvest. 0.01 = 1%.

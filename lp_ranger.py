@@ -699,7 +699,7 @@ class MainWindow(Gtk.Window):
         cbal.pack_start(self.lbl_wallet,False,False,2)
         bgrid=Gtk.Grid();bgrid.set_column_spacing(16);bgrid.set_row_spacing(4)
         self.bal_lbls={}
-        for key,lb,col,row in [("ETH","ETH (nativo)",0,0),("WETH","WETH",1,0),("USDC","USDC",0,1),("total_usd","Total USD",1,1)]:
+        for key,lb,col,row in [("ETH","ETH (nativo, gas)",0,0),("WETH","WETH",1,0),("USDC","USDC",0,1),("total_usd","Total USD (wallet)",1,1),("pool_usd","Pool actual (USD)",0,2),("free_usd","Disponible para pool",1,2)]:
             vbb=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=1)
             vbb.pack_start(_lbl(lb,"ml"),False,False,0)
             vv=_lbl("—","mv-sm");vbb.pack_start(vv,False,False,0)
@@ -712,7 +712,7 @@ class MainWindow(Gtk.Window):
         cbal.pack_start(brow,False,False,4)
         cbal.pack_start(_lbl("Solo se leen y usan activos en Base (chain 8453). Otras redes no se tocan.","sub"),False,False,2)
         cbal.pack_start(_lbl("Tamaño de pool (USD)","stitle"),False,False,8)
-        cbal.pack_start(_lbl("Capital que quieres desplegar en la pool. El resto se queda en la wallet.","sub"),False,False,2)
+        cbal.pack_start(_lbl("Capital a desplegar la PRÓXIMA vez que se abra o rebalancee la pool. Se reserva ~0.001 ETH (≈ $2–3) para gas. El resto se queda en la wallet.","sub"),False,False,2)
         tb=Gtk.Box(spacing=8)
         self.e_target=Gtk.Entry();self.e_target.set_placeholder_text("Ej: 100 (deja vacío para usar todo)")
         self.e_target.get_style_context().add_class("entry")
@@ -793,6 +793,30 @@ class MainWindow(Gtk.Window):
         self.bal_lbls["USDC"].set_text(f"{bd.get('USDC',0):,.2f}")
         total=bd.get("total_usd",0)
         self.bal_lbls["total_usd"].set_markup(f'<span foreground="#34d399">${total:,.2f}</span>')
+        # Pool actual: deposit + fees - IL, only if pool is active.
+        pool_active=stats.get("pool_active",True)
+        if pool_active:
+            pool_usd=max(0.0,stats.get("position_usd",Stats.DEFAULT_POSITION_USD)
+                         +stats.get("total_fees",0)-stats.get("total_il",0))
+            self.bal_lbls["pool_usd"].set_markup(f'<span foreground="#60a5fa">${pool_usd:,.2f}</span>')
+        else:
+            self.bal_lbls["pool_usd"].set_markup('<span foreground="#6b7280">cerrada</span>')
+        # Disponible para pool = wallet (descontando reserva de gas en ETH nativo)
+        eth_p_now=self.app.fetcher.price or 0
+        try:
+            import lp_autobot
+            reserve_eth=float(getattr(lp_autobot,"GAS_RESERVE_ETH",0.001))
+        except Exception:
+            reserve_eth=0.001
+        reserve_usd=reserve_eth*eth_p_now if eth_p_now else 0
+        eth_usd=bd.get("ETH",0)*eth_p_now if eth_p_now else 0
+        free=max(0.0,total-min(reserve_usd,eth_usd))
+        self.bal_lbls["free_usd"].set_markup(f'<span foreground="#e0e6ed">${free:,.2f}</span>')
+        # Also show current target in the placeholder/entry helper text
+        tgt=self.app.config.get("target_pool_usd",0)
+        if tgt and hasattr(self,"e_target"):
+            if not self.e_target.get_text().strip():
+                self.e_target.set_text(f"{float(tgt):.2f}")
         # Recommendation
         for c in self.rec_frame.get_children():self.rec_frame.remove(c)
         if rec:
@@ -878,22 +902,41 @@ class MainWindow(Gtk.Window):
         txt=self.e_target.get_text().strip().replace(",",".")
         if not txt:
             self.app.config.set("target_pool_usd",0)
-            self.app.term.wl("Tamaño de pool: sin límite (usa todo el saldo)","blue")
+            self.app.term.wl("Tamaño objetivo guardado: SIN LÍMITE (usará casi todo el saldo).","blue")
+            self.app.term.wl("  Se aplicará en la próxima apertura/rebalanceo de pool.","dim")
             return
         try:
             v=float(txt)
             if v<0: raise ValueError("negative")
             self.app.config.set("target_pool_usd",v)
-            self.app.term.wl(f"Tamaño de pool objetivo: ${v:,.2f}","green")
+            self.app.term.wl(f"Tamaño objetivo guardado: ${v:,.2f}","green")
+            self.app.term.wl("  Se aplicará en la próxima apertura/rebalanceo. No rebalancea ahora.","dim")
         except Exception:
             self.app.term.wl("Valor inválido. Introduce un número en USD.","red")
     def _target_max(self,btn):
-        total=self.app.balances.data.get("total_usd",0)
+        """Fill the target field with wallet total minus an ETH gas reserve.
+
+        The reserve matches lp_autobot.GAS_RESERVE_ETH (default 0.001 ETH ≈
+        ~20 tx of headroom on Base), expressed in USD at the current price.
+        """
+        bd=self.app.balances.data
+        total=bd.get("total_usd",0)
         if total<=0:
             self.app.term.wl("Primero actualiza los saldos.","yellow"); return
-        # Leave a small buffer for gas + rounding
-        v=max(0.0,total-2.0)
+        eth_p=self.app.fetcher.price or 0
+        try:
+            import lp_autobot
+            reserve_eth=float(getattr(lp_autobot,"GAS_RESERVE_ETH",0.001))
+        except Exception:
+            reserve_eth=0.001
+        reserve_usd=reserve_eth*eth_p if eth_p else 2.5
+        eth_held_usd=bd.get("ETH",0)*eth_p if eth_p else 0
+        # We can only reserve from native ETH. If the user has less native ETH
+        # than the reserve, it effectively all stays out of the pool anyway.
+        effective_reserve=min(reserve_usd,eth_held_usd) if eth_held_usd>0 else 0
+        v=max(0.0,total-effective_reserve-0.50)  # +$0.50 for rounding/slippage
         self.e_target.set_text(f"{v:.2f}")
+        self.app.term.wl(f"Sugerido: ${v:,.2f}  (reservando {reserve_eth:.4f} ETH ≈ ${reserve_usd:.2f} para gas)","blue")
     def _set_range(self,btn):
         try:
             lo=float(self.e_lo.get_text());hi=float(self.e_hi.get_text())
