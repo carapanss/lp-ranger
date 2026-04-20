@@ -121,7 +121,15 @@ class Stats:
     DEFAULT_POSITION_USD = 119.50
     def __init__(self):
         self.d={"total_fees":0,"fees_today":0,"fees_today_date":"","total_il":0,"il_segments":[],
-                "pool_active":True,"hold_asset":None,"position_usd":self.DEFAULT_POSITION_USD}
+                "pool_active":True,"hold_asset":None,"position_usd":self.DEFAULT_POSITION_USD,
+                # Portfolio-level counters that survive reset-fees. These
+                # accumulate across every pool this wallet has opened since
+                # tracking started — matching the "Add Exit"/lifetime view
+                # in Revert.
+                "fees_lifetime":0,
+                "il_lifetime":0,
+                "fees_daily":[],        # [{date:"YYYY-MM-DD", fees:float}] last 60
+                "first_tracking_ts":0}
         loaded = _load_json(STATS_FILE, {})
         if isinstance(loaded, dict):
             self.d.update(loaded)
@@ -130,8 +138,21 @@ class Stats:
     def set(self,k,v): self.d[k]=v; self.save()
     def add_fees(self,a):
         td=datetime.now().strftime("%Y-%m-%d")
-        if self.d["fees_today_date"]!=td: self.d["fees_today"]=0; self.d["fees_today_date"]=td
-        self.d["fees_today"]+=a; self.d["total_fees"]+=a; self.save()
+        if self.d["fees_today_date"]!=td:
+            # Day rolled over — persist yesterday's total in the 60-day
+            # history before clearing the counter. Tomorrow's avg/daily
+            # is calculated from this list + lifetime counter.
+            if self.d["fees_today"]>0 and self.d["fees_today_date"]:
+                dd=self.d.get("fees_daily",[])
+                dd.append({"date":self.d["fees_today_date"],"fees":round(self.d["fees_today"],4)})
+                self.d["fees_daily"]=dd[-60:]
+            self.d["fees_today"]=0; self.d["fees_today_date"]=td
+        self.d["fees_today"]+=a
+        self.d["total_fees"]+=a
+        self.d["fees_lifetime"]=self.d.get("fees_lifetime",0)+a
+        if not self.d.get("first_tracking_ts"):
+            self.d["first_tracking_ts"]=time.time()
+        self.save()
     def _position_value(self):
         """Current estimated USD value of the position (deposit + fees − IL)."""
         return max(self.d.get("position_usd", self.DEFAULT_POSITION_USD)
@@ -145,6 +166,7 @@ class Stats:
         if il_usd == 0:
             self.save(); return 0
         self.d["total_il"]+=il_usd
+        self.d["il_lifetime"]=self.d.get("il_lifetime",0)+il_usd
         self.d["il_segments"].append({
             "date":datetime.now().isoformat()[:16],
             "old":f"${olo:.0f}-${ohi:.0f}",
@@ -152,6 +174,35 @@ class Stats:
             "price":round(p,0),"il_pct":round(il_pct*100,2),"il_usd":round(il_usd,2)})
         self.d["il_segments"]=self.d["il_segments"][-100:]
         self.save(); return il_usd
+    def days_tracked(self):
+        start=self.d.get("first_tracking_ts",0)
+        if not start: return 0
+        return max(1/24, (time.time()-start)/86400)  # at least one hour worth
+    def avg_daily_fees(self):
+        days=self.days_tracked()
+        if days<=0: return 0
+        return self.d.get("fees_lifetime",0)/days
+    def fees_24h(self):
+        """Approximate rolling 24h fees from today + fraction of yesterday."""
+        td=datetime.now().strftime("%Y-%m-%d")
+        today=self.d.get("fees_today",0) if self.d.get("fees_today_date")==td else 0
+        # Fraction of yesterday still inside the 24h window.
+        now=datetime.now()
+        secs_into_today=now.hour*3600+now.minute*60+now.second
+        frac_yesterday_in_window=max(0.0,1 - secs_into_today/86400)
+        dd=self.d.get("fees_daily",[])
+        yest=0
+        if dd:
+            ylast=dd[-1]
+            # Only count if it's literally yesterday (avoid summing old gaps).
+            yest_date=(now - __import__("datetime").timedelta(days=1)).strftime("%Y-%m-%d")
+            if ylast.get("date")==yest_date:
+                yest=ylast.get("fees",0)*frac_yesterday_in_window
+        return today+yest
+    def total_pnl(self):
+        """Lifetime PnL approximation: fees_lifetime − il_lifetime.
+        Matches Revert's "total PnL (excluding gas)" in concept."""
+        return self.d.get("fees_lifetime",0) - self.d.get("il_lifetime",0)
 
 class Fetcher:
     def __init__(self): self.price=0;self.change=0;self.pos=None;self.error=None
@@ -591,9 +642,10 @@ class Term(Gtk.Box):
                 GLib.idle_add(self.wl,"Credenciales borradas de memoria","yellow")
                 return
             if verb in ("reset-fees","resetfees","reset"):
+                # Per-pool counters only — lifetime totals survive.
                 self.app.stats.d["total_fees"]=0;self.app.stats.d["fees_today"]=0;self.app.stats.d["total_il"]=0
                 self.app.stats.save()
-                GLib.idle_add(self.wl,"Fees e IL reseteados a $0","green")
+                GLib.idle_add(self.wl,"Fees e IL del pool actual reseteados. Histórico conservado.","green")
                 GLib.idle_add(self.app.force_update)
                 return
             if verb=="setup":
@@ -707,6 +759,26 @@ class MainWindow(Gtk.Window):
             vb2=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=2);vb2.pack_start(_lbl(lb,"ml"),False,False,0)
             v=_lbl("—","mv-sm");vb2.pack_start(v,False,False,0);self.m[key]=v;g.attach(vb2,col,row,1,1)
         c2.pack_start(g,False,False,0);self.dash_box.pack_start(c2,False,False,0)
+        # Histórico de TODAS las pools (Revert-style). Persistente, no se
+        # borra con reset-fees. Empezó a contar en la versión que lo añadió.
+        cp=_card()
+        cp.pack_start(_lbl("Histórico (todas las pools)","stitle"),False,False,0)
+        cp.pack_start(_lbl("Desde que empezaste a usar LP Ranger. No se resetea con reset-fees.","sub"),False,False,2)
+        gp=Gtk.Grid();gp.set_column_spacing(16);gp.set_row_spacing(10);self.mp={}
+        for key,lb,col,row in [
+            ("pnl_life","PnL total (vida)",0,0),
+            ("fees_life","Fees totales",1,0),
+            ("fees_24h","Fees 24h",0,1),
+            ("fees_avg","Avg diario",1,1),
+            ("days_tr","Días trackeando",0,2),
+            ("il_life","IL total",1,2),
+        ]:
+            vb2=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=2)
+            vb2.pack_start(_lbl(lb,"ml"),False,False,0)
+            vv=_lbl("—","mv-sm");vb2.pack_start(vv,False,False,0)
+            self.mp[key]=vv;gp.attach(vb2,col,row,1,1)
+        cp.pack_start(gp,False,False,0)
+        self.dash_box.pack_start(cp,False,False,0)
         self.rec_frame=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=6);self.rec_frame.set_no_show_all(True)
         self.dash_box.pack_start(self.rec_frame,False,False,0)
         sc1=Gtk.ScrolledWindow();sc1.set_policy(Gtk.PolicyType.NEVER,Gtk.PolicyType.AUTOMATIC);sc1.add(self.dash_box)
@@ -816,6 +888,23 @@ class MainWindow(Gtk.Window):
         self.m["fees_24h"].set_markup(f'<span foreground="#34d399">${stats.get("fees_today",0):.2f}</span>')
         self.m["fees_total"].set_markup(f'<span foreground="#34d399">${stats.get("total_fees",0):.2f}</span>')
         self.m["il_total"].set_markup(f'<span foreground="#f87171">-${stats.get("total_il",0):.2f}</span>')
+        # Lifetime portfolio (Revert-style, across all past pools)
+        st=self.app.stats
+        pnl=st.total_pnl()
+        pnl_color="#34d399" if pnl>=0 else "#f87171"
+        self.mp["pnl_life"].set_markup(f'<span foreground="{pnl_color}">{"+" if pnl>=0 else ""}${pnl:,.2f}</span>')
+        self.mp["fees_life"].set_markup(f'<span foreground="#34d399">${st.d.get("fees_lifetime",0):,.2f}</span>')
+        f24=st.fees_24h()
+        self.mp["fees_24h"].set_markup(f'<span foreground="#34d399">${f24:,.2f}</span>')
+        avg=st.avg_daily_fees()
+        self.mp["fees_avg"].set_markup(f'<span foreground="#34d399">${avg:,.2f}/día</span>')
+        days=st.days_tracked()
+        if days<1:
+            dstr=f"{int(days*24)} h"
+        else:
+            dstr=f"{days:.1f} d"
+        self.mp["days_tr"].set_text(dstr)
+        self.mp["il_life"].set_markup(f'<span foreground="#f87171">-${st.d.get("il_lifetime",0):,.2f}</span>')
         self.m["strat"].set_text(self.app.strategy.cfg.get("strategy_type","—"))
         self.lbl_sname.set_text(self.app.strategy.cfg.get("name","—"))
         bt=self.app.strategy.cfg.get("backtest_results",{})
