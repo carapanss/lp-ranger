@@ -1338,6 +1338,7 @@ class TxBuilder:
         print(f"TOP-UP: Position {token_id}  +${add_usd:,.2f}")
         print(f"{'='*50}")
 
+        from web3 import Web3
         pool_price = self.get_pool_price_usdc_per_eth(fee)
         bals = self.get_balances()
         weth_usd = bals["WETH"] * pool_price
