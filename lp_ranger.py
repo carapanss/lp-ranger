@@ -209,7 +209,9 @@ class Fetcher:
                 if tu>=2**255:tu-=2**256
                 plo=1.0001**tl*1e12;phi=1.0001**tu*1e12
                 if plo>phi:plo,phi=phi,plo
-                self.pos={"lo":round(plo,2),"hi":round(phi,2),"fee":int(flds[4],16),"liq":int(flds[7],16)}
+                self.pos={"lo":round(plo,2),"hi":round(phi,2),
+                          "tick_lo":tl,"tick_hi":tu,
+                          "fee":int(flds[4],16),"liq":int(flds[7],16)}
                 self.error=None;return True
             self.error="Posicion no encontrada";return False
         except Exception as e: self.error=str(e);return False
@@ -237,6 +239,40 @@ def _rpc_call(method, params, timeout=10):
         except Exception as e:
             last_err = e
     return None
+
+def position_value_usd(liq, tick_lo, tick_hi, price_usdc_per_eth):
+    """Compute the on-chain USD value of an open V3 position.
+
+    Uses the Uniswap V3 closed-form for amounts given liquidity, the range,
+    and the current price. Token0 = WETH (18 dec), token1 = USDC (6 dec) on
+    the Base WETH/USDC pool, so amount0/1e18 is WETH and amount1/1e6 is USDC.
+
+    Returns (value_usd, weth_amount, usdc_amount). Float math — precise
+    enough for a GUI display; the autobot uses integer sqrtPriceX96 math.
+    """
+    if liq <= 0 or price_usdc_per_eth <= 0:
+        return 0.0, 0.0, 0.0
+    if tick_lo > tick_hi:
+        tick_lo, tick_hi = tick_hi, tick_lo
+    # raw_ratio = token1/token0 in smallest units = (usdc_per_eth) * 1e-12
+    raw = price_usdc_per_eth / 1e12
+    sqrt_p = math.sqrt(raw)
+    sqrt_a = 1.0001 ** (tick_lo / 2)
+    sqrt_b = 1.0001 ** (tick_hi / 2)
+    L = float(liq)
+    if sqrt_p <= sqrt_a:
+        amount0 = L * (sqrt_b - sqrt_a) / (sqrt_a * sqrt_b)
+        amount1 = 0.0
+    elif sqrt_p >= sqrt_b:
+        amount0 = 0.0
+        amount1 = L * (sqrt_b - sqrt_a)
+    else:
+        amount0 = L * (sqrt_b - sqrt_p) / (sqrt_p * sqrt_b)
+        amount1 = L * (sqrt_p - sqrt_a)
+    weth = amount0 / 1e18
+    usdc = amount1 / 1e6
+    return weth * price_usdc_per_eth + usdc, weth, usdc
+
 
 class BalancesFetcher:
     """Fetches ETH/WETH/USDC balances for a Base-chain wallet.
@@ -804,12 +840,17 @@ class MainWindow(Gtk.Window):
         self.bal_lbls["USDC"].set_text(f"{bd.get('USDC',0):,.2f}")
         total=bd.get("total_usd",0)
         self.bal_lbls["total_usd"].set_markup(f'<span foreground="#34d399">${total:,.2f}</span>')
-        # Pool actual: deposit + fees - IL, only if pool is active.
+        # Pool actual: compute the real on-chain value from liquidity + range
+        # + current price. The in-memory stats (position_usd + fees − IL) is
+        # a claim-tracking estimate that drifts when the position is topped
+        # up, partially closed or collected outside the GUI.
         pool_active=stats.get("pool_active",True)
-        if pool_active:
-            pool_usd=max(0.0,stats.get("position_usd",Stats.DEFAULT_POSITION_USD)
-                         +stats.get("total_fees",0)-stats.get("total_il",0))
+        pos=self.app.fetcher.pos
+        if pool_active and pos and pos.get("liq",0)>0 and "tick_lo" in pos and price>0:
+            pool_usd,_w,_u=position_value_usd(pos["liq"],pos["tick_lo"],pos["tick_hi"],price)
             self.bal_lbls["pool_usd"].set_markup(f'<span foreground="#60a5fa">${pool_usd:,.2f}</span>')
+        elif pool_active:
+            self.bal_lbls["pool_usd"].set_markup('<span foreground="#6b7280">—</span>')
         else:
             self.bal_lbls["pool_usd"].set_markup('<span foreground="#6b7280">cerrada</span>')
         # Disponible para pool = wallet (descontando reserva de gas en ETH nativo)
