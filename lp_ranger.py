@@ -204,24 +204,38 @@ class Stats:
         start=self.d.get("first_tracking_ts",0)
         if not start: return 0
         return max(1/24, (time.time()-start)/86400)  # at least one hour worth
-    def avg_daily_fees(self, window_days=7):
-        """Rolling ``window_days`` average of daily fees.
+    def avg_daily_fees(self, half_life_days=3):
+        """Exponentially-weighted daily fees — recent days dominate.
 
-        Unlike a divide-by-lifetime average, this reacts within a week
-        when capital is added/removed — matching what a user expects after
-        topping up a pool. Uses the last ``window_days-1`` closed days
-        from ``fees_daily`` plus today's partial day.
+        Each closed day at age ``k`` gets weight ``exp(-k/tau)`` with
+        ``tau = half_life_days / ln(2)``; today is partial so contributes
+        ``fees_today`` (numerator) / ``frac_today`` (denominator). Result
+        is the weighted mean fees-per-day. Half-life 3d means yesterday
+        weighs ~0.79, day-3 weighs 0.5, day-7 weighs 0.20 — so a capital
+        top-up shows meaningful movement within 24-48h and converges
+        within ~1 week, much faster than Revert's lifetime divide.
         """
+        import math
         td=datetime.now().strftime("%Y-%m-%d")
-        today=self.d.get("fees_today",0) if self.d.get("fees_today_date")==td else 0
         now=datetime.now()
         frac_today=(now.hour*3600+now.minute*60+now.second)/86400
-        closed=self.d.get("fees_daily",[])[-(window_days-1):] if window_days>1 else []
-        total=sum(d.get("fees",0) for d in closed)+today
-        denom=len(closed)+frac_today
-        # Floor to avoid a giant projection from the first minutes of use.
-        if denom < 1/24: denom = 1/24
-        return total/denom
+        today=self.d.get("fees_today",0) if self.d.get("fees_today_date")==td else 0
+        tau=half_life_days/math.log(2)
+        num=today
+        den=frac_today if frac_today>0 else 1/24
+        now_date=now.date()
+        for entry in self.d.get("fees_daily",[])[-30:]:
+            try:
+                ed=datetime.strptime(entry["date"],"%Y-%m-%d").date()
+            except Exception:
+                continue
+            age=(now_date-ed).days
+            if age<=0: continue
+            w=math.exp(-age/tau)
+            num+=w*entry.get("fees",0)
+            den+=w
+        if den<=0: return 0
+        return num/den
 
     def avg_daily_fees_lifetime(self):
         """Lifetime divide (kept for reference/PnL context)."""
@@ -815,7 +829,7 @@ class MainWindow(Gtk.Window):
             ("pnl_life","PnL total (vida)",0,0),
             ("fees_life","Fees totales",1,0),
             ("fees_24h","Fees 24h",0,1),
-            ("fees_avg","Avg diario (7d)",1,1),
+            ("fees_avg","Avg diario (EMA 3d)",1,1),
             ("days_tr","Días trackeando",0,2),
             ("il_life","IL total",1,2),
         ]:
