@@ -204,7 +204,27 @@ class Stats:
         start=self.d.get("first_tracking_ts",0)
         if not start: return 0
         return max(1/24, (time.time()-start)/86400)  # at least one hour worth
-    def avg_daily_fees(self):
+    def avg_daily_fees(self, window_days=7):
+        """Rolling ``window_days`` average of daily fees.
+
+        Unlike a divide-by-lifetime average, this reacts within a week
+        when capital is added/removed — matching what a user expects after
+        topping up a pool. Uses the last ``window_days-1`` closed days
+        from ``fees_daily`` plus today's partial day.
+        """
+        td=datetime.now().strftime("%Y-%m-%d")
+        today=self.d.get("fees_today",0) if self.d.get("fees_today_date")==td else 0
+        now=datetime.now()
+        frac_today=(now.hour*3600+now.minute*60+now.second)/86400
+        closed=self.d.get("fees_daily",[])[-(window_days-1):] if window_days>1 else []
+        total=sum(d.get("fees",0) for d in closed)+today
+        denom=len(closed)+frac_today
+        # Floor to avoid a giant projection from the first minutes of use.
+        if denom < 1/24: denom = 1/24
+        return total/denom
+
+    def avg_daily_fees_lifetime(self):
+        """Lifetime divide (kept for reference/PnL context)."""
         days=self.days_tracked()
         if days<=0: return 0
         return self.d.get("fees_lifetime",0)/days
@@ -795,7 +815,7 @@ class MainWindow(Gtk.Window):
             ("pnl_life","PnL total (vida)",0,0),
             ("fees_life","Fees totales",1,0),
             ("fees_24h","Fees 24h",0,1),
-            ("fees_avg","Avg diario",1,1),
+            ("fees_avg","Avg diario (7d)",1,1),
             ("days_tr","Días trackeando",0,2),
             ("il_life","IL total",1,2),
         ]:
