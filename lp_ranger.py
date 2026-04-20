@@ -133,6 +133,32 @@ class Stats:
         loaded = _load_json(STATS_FILE, {})
         if isinstance(loaded, dict):
             self.d.update(loaded)
+        self._migrate_lifetime()
+
+    def _migrate_lifetime(self):
+        """One-time seed of lifetime counters from pre-existing totals.
+
+        If a user upgrades to a build with lifetime tracking after having
+        accumulated fees/IL in a pool, starting the counter at 0 makes the
+        avg-daily estimate compress a long history into a tiny window, so
+        the displayed APR looks absurd. Fold the current totals in and
+        anchor the tracking start to the stats file mtime so the first
+        day's average matches Revert's view.
+        """
+        need_save=False
+        if self.d.get("fees_lifetime",0)==0 and self.d.get("total_fees",0)>0:
+            self.d["fees_lifetime"]=self.d["total_fees"]; need_save=True
+        if self.d.get("il_lifetime",0)==0 and self.d.get("total_il",0)>0:
+            self.d["il_lifetime"]=self.d["total_il"]; need_save=True
+        if not self.d.get("first_tracking_ts",0):
+            try:
+                mtime=STATS_FILE.stat().st_mtime if STATS_FILE.exists() else 0
+            except Exception:
+                mtime=0
+            # Fall back to "now" only if stats has never been written.
+            self.d["first_tracking_ts"]=mtime or time.time()
+            need_save=True
+        if need_save: self.save()
     def save(self): _write_json(STATS_FILE, self.d)
     def get(self,k,d=None): return self.d.get(k,d)
     def set(self,k,v): self.d[k]=v; self.save()
