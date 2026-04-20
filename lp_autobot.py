@@ -729,6 +729,25 @@ class TxBuilder:
             amount1 = L * (sqrt_b - sqrt_a) // Q96
         return amount0, amount1
     
+    def _wrap_eth(self, amount_eth):
+        """Wrap native ETH → WETH via WETH9.deposit() payable."""
+        if amount_eth <= 0:
+            return None
+        wei = int(amount_eth * 1e18)
+        # WETH9.deposit() selector = 0xd0e30db0
+        tx = {
+            'to': self.weth.address,
+            'from': self.address,
+            'nonce': self._get_nonce(),
+            'gas': 60000,
+            'gasPrice': self._gas_price(),
+            'chainId': CHAIN_ID,
+            'value': wei,
+            'data': '0xd0e30db0',
+        }
+        tx_hash, _ = self._send_and_wait(tx, "ETH wrapped → WETH")
+        return tx_hash
+
     def swap_exact_input(self, token_in, token_out, amount_in, fee=500, slippage=None):
         """Swap tokens using SwapRouter02 with MEV-aware slippage.
 
@@ -1341,17 +1360,21 @@ class TxBuilder:
         from web3 import Web3
         pool_price = self.get_pool_price_usdc_per_eth(fee)
         bals = self.get_balances()
+        # Native ETH above gas reserve is spendable (we wrap it to WETH below).
+        spendable_eth = max(0.0, bals["ETH"] - GAS_RESERVE_ETH)
+        eth_usd = spendable_eth * pool_price
         weth_usd = bals["WETH"] * pool_price
         usdc_usd = bals["USDC"]
-        wallet_usd = weth_usd + usdc_usd
-        print(f"  Wallet: {bals['WETH']:.6f} WETH + {bals['USDC']:.2f} USDC ≈ ${wallet_usd:,.2f}")
+        wallet_usd = eth_usd + weth_usd + usdc_usd
+        print(f"  Wallet: {bals['WETH']:.6f} WETH + {bals['USDC']:.2f} USDC "
+              f"+ {spendable_eth:.6f} ETH (spendable) ≈ ${wallet_usd:,.2f}")
 
         if add_usd > wallet_usd * 0.99:
             print(f"  ⚠ want ${add_usd:,.2f} but wallet only has ${wallet_usd:,.2f}. Clamping.")
             add_usd = wallet_usd * 0.99
 
         if dry_run:
-            print("  🔍 DRY RUN — would swap to 50/50 and increaseLiquidity.")
+            print("  🔍 DRY RUN — would wrap ETH if needed, swap to 50/50, and increaseLiquidity.")
             return {"status": "dry_run", "add_usd": add_usd}
 
         ok, _ = self.check_gas(0.00025)
@@ -1364,6 +1387,17 @@ class TxBuilder:
             print("  Cancelled."); return {"status": "cancelled"}
 
         self._reset_nonce()
+
+        # Wrap native ETH → WETH if we'd need it to reach add_usd.
+        current_weth_usdc = weth_usd + usdc_usd
+        if add_usd > current_weth_usdc and spendable_eth > 0:
+            needed_usd = add_usd - current_weth_usdc
+            wrap_eth = min(spendable_eth, needed_usd / max(pool_price, 1e-9))
+            if wrap_eth * pool_price > 0.10:  # skip dust wraps (<$0.10)
+                print(f"  Wrapping {wrap_eth:.6f} ETH → WETH (~${wrap_eth*pool_price:.2f})...")
+                self._wrap_eth(wrap_eth)
+                time.sleep(2)
+                bals = self.get_balances()
 
         # Swap to 50/50 of add_usd.
         half = add_usd / 2.0
