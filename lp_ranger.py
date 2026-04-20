@@ -724,6 +724,17 @@ class MainWindow(Gtk.Window):
         bmax=Gtk.Button(label="Usar todo");bmax.get_style_context().add_class("btn-dim")
         bmax.connect("clicked",self._target_max);tb.pack_start(bmax,False,False,0)
         cbal.pack_start(tb,False,False,0)
+        # "Redistribuir ahora" — executes on-chain: tops up or partial-closes
+        # the open position until it matches the target. Does NOT close the
+        # NFT (uses increaseLiquidity / decreaseLiquidity).
+        rdrow=Gtk.Box(spacing=8)
+        bredist=Gtk.Button(label="Redistribuir ahora")
+        bredist.get_style_context().add_class("btn-b")
+        bredist.connect("clicked",self._redistribute_now)
+        rdrow.pack_start(bredist,False,False,0)
+        rdhint=_lbl("Añade o retira sin cerrar la pool (increase/decreaseLiquidity).","sub")
+        rdhint.set_line_wrap(True);rdrow.pack_start(rdhint,True,True,0)
+        cbal.pack_start(rdrow,False,False,4)
         cfg_box.pack_start(cbal,False,False,0)
         # Quick actions
         c4=_card();c4.pack_start(_lbl("Acciones rapidas","stitle"),False,False,0)
@@ -913,6 +924,57 @@ class MainWindow(Gtk.Window):
             self.app.term.wl("  Se aplicará en la próxima apertura/rebalanceo. No rebalancea ahora.","dim")
         except Exception:
             self.app.term.wl("Valor inválido. Introduce un número en USD.","red")
+    def _redistribute_now(self,btn):
+        """Trigger an on-chain redistribution to the saved target USD.
+
+        Uses lp_autobot --redistribute so the bot decides top_up vs
+        partial_close based on the *on-chain* pool value (not the GUI
+        estimate, which trails).
+        """
+        txt=self.e_target.get_text().strip().replace(",",".")
+        tgt=None
+        if txt:
+            try: tgt=float(txt)
+            except Exception: pass
+        if tgt is None:
+            tgt=float(self.app.config.get("target_pool_usd",0) or 0)
+        if not tgt or tgt<=0:
+            self.app.term.wl("Guarda primero un tamaño objetivo (>0).","red"); return
+        pid=self.app.config.get("position_id","")
+        if not pid:
+            self.app.term.wl("No hay Position ID configurado.","red"); return
+        if not self.app.stats.get("pool_active",True):
+            self.app.term.wl("La pool está cerrada. Usa 'enter' para abrirla con el tamaño objetivo.","yellow"); return
+        # Persist so next auto-run uses the same target even if the user closes the app.
+        self.app.config.set("target_pool_usd",tgt)
+        self.app.term.wl(f"▶ Redistribuir a ${tgt:,.2f} en posición {pid}...","blue")
+        autobot=str(APP_DIR/"lp_autobot.py")
+        cmd=[sys.executable,autobot,"--redistribute","-p",str(pid),"-y","--target-usd",str(tgt)]
+        pk=self.app.term._cached_pk if self.app.term else None
+        pw=self.app.term._cached_pw if self.app.term else None
+        if not (pk or pw):
+            self.app.term.wl("Wallet bloqueada. Desbloquea primero (terminal: unlock).","red"); return
+        def run():
+            try:
+                r=_run_autobot(cmd,password=pw,pk=pk)
+                for line in (r.stdout+r.stderr).split("\n"):
+                    if not line.strip(): continue
+                    if any(x in line for x in ["GetPassWarning","fallback_getpass","Password input may be echoed","Unlock password","Can not control echo"]): continue
+                    tag=None;ll=line.lower()
+                    if "error" in ll or "failed" in ll: tag="red"
+                    elif "✅" in line or "success" in ll: tag="green"
+                    elif "⚠" in line or "warning" in ll: tag="yellow"
+                    GLib.idle_add(self.app.term.wl,line,tag)
+                if r.returncode==0:
+                    GLib.idle_add(self.app.term.wl,"✓ Redistribución completada","green")
+                    # Refresh balances after the state change.
+                    threading.Thread(target=self.app._fetch_balances,daemon=True).start()
+                    GLib.idle_add(self.app.force_update)
+                else:
+                    GLib.idle_add(self.app.term.wl,"✗ Redistribución falló","red")
+            except Exception as e:
+                GLib.idle_add(self.app.term.wl,f"Error: {e}","red")
+        threading.Thread(target=run,daemon=True).start()
     def _target_max(self,btn):
         """Fill the target field with wallet total minus an ETH gas reserve.
 

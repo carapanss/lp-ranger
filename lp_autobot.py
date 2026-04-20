@@ -1302,6 +1302,236 @@ class TxBuilder:
         print(f"\n  ✅ Position opened!")
         return result
 
+    def position_value_usd(self, token_id, fee=500):
+        """Return (value_usd, weth_amount, usdc_amount) for an open position.
+
+        Uses ``_estimate_burn_amounts`` (Uniswap V3 math on sqrtPriceX96) so
+        the value reflects exactly what would be returned by a full close,
+        minus uncollected fees (those are queried separately if needed).
+        """
+        pos = get_position(token_id)
+        if not pos or pos["liquidity"] == 0:
+            return 0.0, 0.0, 0.0
+        a0, a1 = self._estimate_burn_amounts(pos, fee)
+        # On Base the WETH-USDC pool has WETH = token0, USDC = token1.
+        # Confirm dynamically to stay correct if that ever changes.
+        pool_t0, _ = self._pool_token_order(fee)
+        weth_is_t0 = pool_t0.lower() == WETH.lower()
+        weth_raw = a0 if weth_is_t0 else a1
+        usdc_raw = a1 if weth_is_t0 else a0
+        weth = weth_raw / 1e18
+        usdc = usdc_raw / 1e6
+        price = self.get_pool_price_usdc_per_eth(fee)
+        return weth * price + usdc, weth, usdc
+
+    def top_up_position(self, token_id, add_usd, fee=500,
+                         dry_run=False, auto_confirm=False):
+        """Add ``add_usd`` worth of liquidity to an existing position.
+
+        Swaps wallet balances to a 50/50 USD split (close to what the pool
+        will consume for an in-range add), then calls ``increaseLiquidity``.
+        Leftover dust stays in the wallet — the PM only pulls what fits.
+        """
+        if add_usd is None or add_usd <= 0:
+            print("  top-up: add_usd must be > 0"); return {"status": "noop"}
+        print(f"\n{'='*50}")
+        print(f"TOP-UP: Position {token_id}  +${add_usd:,.2f}")
+        print(f"{'='*50}")
+
+        pool_price = self.get_pool_price_usdc_per_eth(fee)
+        bals = self.get_balances()
+        weth_usd = bals["WETH"] * pool_price
+        usdc_usd = bals["USDC"]
+        wallet_usd = weth_usd + usdc_usd
+        print(f"  Wallet: {bals['WETH']:.6f} WETH + {bals['USDC']:.2f} USDC ≈ ${wallet_usd:,.2f}")
+
+        if add_usd > wallet_usd * 0.99:
+            print(f"  ⚠ want ${add_usd:,.2f} but wallet only has ${wallet_usd:,.2f}. Clamping.")
+            add_usd = wallet_usd * 0.99
+
+        if dry_run:
+            print("  🔍 DRY RUN — would swap to 50/50 and increaseLiquidity.")
+            return {"status": "dry_run", "add_usd": add_usd}
+
+        ok, _ = self.check_gas(0.00025)
+        if not ok:
+            return {"status": "insufficient_gas"}
+
+        confirm = "y" if auto_confirm else input(
+            f"  Add ${add_usd:,.2f} to position {token_id}? [y/N]: ").strip().lower()
+        if confirm != 'y':
+            print("  Cancelled."); return {"status": "cancelled"}
+
+        self._reset_nonce()
+
+        # Swap to 50/50 of add_usd.
+        half = add_usd / 2.0
+        target_weth = half / pool_price
+        target_usdc = half
+        if bals["WETH"] < target_weth * 0.999 and bals["USDC"] > target_usdc:
+            need_usd = (target_weth - bals["WETH"]) * pool_price
+            swap_usdc = min(need_usd * 1.005, bals["USDC"] - target_usdc)
+            if swap_usdc > 0.5:
+                print(f"  Swapping {swap_usdc:.2f} USDC → WETH...")
+                self.swap_exact_input(USDC, WETH, int(swap_usdc * 1e6), fee)
+                time.sleep(2)
+        elif bals["USDC"] < target_usdc * 0.999 and bals["WETH"] > target_weth:
+            need_usdc = target_usdc - bals["USDC"]
+            swap_weth = min((need_usdc / pool_price) * 1.005, bals["WETH"] - target_weth)
+            if swap_weth > 0.00001:
+                print(f"  Swapping {swap_weth:.6f} WETH → USDC...")
+                self.swap_exact_input(WETH, USDC, int(swap_weth * 1e18), fee)
+                time.sleep(2)
+
+        bals = self.get_balances()
+        # Only deposit up to add_usd worth per side — excess stays in wallet.
+        deposit_weth = min(bals["WETH"], target_weth)
+        deposit_usdc = min(bals["USDC"], target_usdc)
+        a_weth_raw = int(deposit_weth * 1e18)
+        a_usdc_raw = int(deposit_usdc * 1e6)
+
+        pool_t0, pool_t1 = self._pool_token_order(fee)
+        weth_is_t0 = pool_t0.lower() == WETH.lower()
+        if weth_is_t0:
+            a0, a1 = a_weth_raw, a_usdc_raw
+        else:
+            a0, a1 = a_usdc_raw, a_weth_raw
+
+        if a0 == 0 and a1 == 0:
+            print("  Nothing to deposit."); return {"status": "no_funds"}
+
+        if a0 > 0:
+            self.ensure_approval(
+                self.w3.eth.contract(address=Web3.to_checksum_address(pool_t0), abi=ERC20_ABI),
+                POSITION_MANAGER, a0)
+        if a1 > 0:
+            self.ensure_approval(
+                self.w3.eth.contract(address=Web3.to_checksum_address(pool_t1), abi=ERC20_ABI),
+                POSITION_MANAGER, a1)
+
+        deadline = int(time.time()) + 600
+        gas_price = self._gas_price()
+        tx = self.pm.functions.increaseLiquidity((
+            token_id, a0, a1, 0, 0, deadline,  # mins=0: retail-scale dust risk only
+        )).build_transaction({
+            'from': self.address, 'nonce': self._get_nonce(),
+            'gas': 350000, 'gasPrice': gas_price,
+            'chainId': CHAIN_ID, 'value': 0,
+        })
+        tx_hash, _ = self._send_and_wait(tx, "liquidity increased", timeout=240)
+
+        # Revoke any remaining allowances.
+        for tok in (pool_t0, pool_t1):
+            try:
+                tc = self.w3.eth.contract(address=Web3.to_checksum_address(tok), abi=ERC20_ABI)
+                self.revoke_approval(tc, POSITION_MANAGER)
+            except Exception:
+                pass
+
+        print(f"  ✅ Added ${add_usd:,.2f} to position {token_id}")
+        return {"status": "ok", "added_usd": add_usd, "tx": tx_hash.hex()}
+
+    def partial_close_position(self, token_id, remove_usd, fee=500,
+                                dry_run=False, auto_confirm=False):
+        """Withdraw ``remove_usd`` worth of liquidity (proportional burn).
+
+        Computes the liquidity fraction needed to free that USD value at the
+        current price, calls ``decreaseLiquidity`` + ``collect``. The withdrawn
+        tokens land in the wallet — we do NOT auto-swap to a single asset.
+        """
+        if remove_usd is None or remove_usd <= 0:
+            print("  partial-close: remove_usd must be > 0"); return {"status": "noop"}
+        print(f"\n{'='*50}")
+        print(f"PARTIAL CLOSE: Position {token_id}  -${remove_usd:,.2f}")
+        print(f"{'='*50}")
+
+        pos = get_position(token_id)
+        if not pos or pos["liquidity"] == 0:
+            print("  Position has no liquidity."); return {"status": "empty"}
+
+        value_usd, _weth, _usdc = self.position_value_usd(token_id, fee)
+        print(f"  Pool value: ${value_usd:,.2f}  (liq {pos['liquidity']})")
+        if remove_usd >= value_usd * 0.99:
+            print(f"  ⚠ remove ${remove_usd:,.2f} ≈ full position. Use --exit instead.")
+            return {"status": "use_exit"}
+
+        fraction = remove_usd / max(value_usd, 1e-9)
+        liquidity_to_burn = int(pos["liquidity"] * fraction)
+        if liquidity_to_burn <= 0:
+            print("  Liquidity fraction is zero."); return {"status": "noop"}
+
+        if dry_run:
+            print(f"  🔍 DRY RUN — would burn {fraction*100:.2f}% of liquidity.")
+            return {"status": "dry_run", "fraction": fraction}
+
+        ok, _ = self.check_gas(0.00025)
+        if not ok:
+            return {"status": "insufficient_gas"}
+
+        confirm = "y" if auto_confirm else input(
+            f"  Remove ${remove_usd:,.2f} ({fraction*100:.1f}%) from position {token_id}? [y/N]: "
+        ).strip().lower()
+        if confirm != 'y':
+            print("  Cancelled."); return {"status": "cancelled"}
+
+        self._reset_nonce()
+
+        # Estimate mins for slippage protection on the partial burn.
+        try:
+            exp0, exp1 = self._estimate_burn_amounts(pos, fee)
+            min0 = max(0, int(exp0 * fraction * (1 - self.slippage)))
+            min1 = max(0, int(exp1 * fraction * (1 - self.slippage)))
+        except Exception:
+            min0, min1 = 0, 0
+
+        deadline = int(time.time()) + 600
+        gas_price = self._gas_price()
+        tx1 = self.pm.functions.decreaseLiquidity((
+            token_id, liquidity_to_burn, min0, min1, deadline,
+        )).build_transaction({
+            'from': self.address, 'nonce': self._get_nonce(),
+            'gas': 300000, 'gasPrice': gas_price,
+            'chainId': CHAIN_ID, 'value': 0,
+        })
+        tx_hash1, _ = self._send_and_wait(tx1, "liquidity decreased")
+
+        MAX_UINT128 = 2**128 - 1
+        tx2 = self.pm.functions.collect((
+            token_id, self.address, MAX_UINT128, MAX_UINT128,
+        )).build_transaction({
+            'from': self.address, 'nonce': self._get_nonce(),
+            'gas': 200000, 'gasPrice': gas_price,
+            'chainId': CHAIN_ID, 'value': 0,
+        })
+        tx_hash2, _ = self._send_and_wait(tx2, "tokens collected")
+
+        print(f"  ✅ Withdrew ${remove_usd:,.2f} from position {token_id}")
+        return {"status": "ok", "removed_usd": remove_usd,
+                "decrease_tx": tx_hash1.hex(), "collect_tx": tx_hash2.hex()}
+
+    def redistribute_to_target(self, token_id, target_usd, fee=500,
+                                dry_run=False, auto_confirm=False, tolerance_usd=2.0):
+        """Drive the position to ``target_usd`` by topping up or partial closing.
+
+        Reads the on-chain pool value (not the GUI estimate) and only acts
+        when the gap exceeds ``tolerance_usd`` — skipping tiny adjustments
+        whose gas would dominate.
+        """
+        print(f"\n{'='*50}")
+        print(f"REDISTRIBUTE: Position {token_id} → target ${target_usd:,.2f}")
+        print(f"{'='*50}")
+        cur_usd, _weth, _usdc = self.position_value_usd(token_id, fee)
+        print(f"  Current pool value: ${cur_usd:,.2f}")
+        delta = target_usd - cur_usd
+        print(f"  Delta: {'+' if delta >= 0 else ''}${delta:,.2f}")
+        if abs(delta) < tolerance_usd:
+            print(f"  Within tolerance (±${tolerance_usd:.2f}). No action.")
+            return {"status": "within_tolerance", "current_usd": cur_usd, "delta": delta}
+        if delta > 0:
+            return self.top_up_position(token_id, delta, fee, dry_run, auto_confirm)
+        else:
+            return self.partial_close_position(token_id, -delta, fee, dry_run, auto_confirm)
+
 
 # ============================================================
 # CLI INTERFACE
@@ -1355,6 +1585,14 @@ def main():
     parser.add_argument("--enter", action="store_true", help="Enter pool")
     parser.add_argument("--compound", action="store_true",
                         help="Collect pending fees and redeposit (only if gas <= --compound-ratio of fees)")
+    parser.add_argument("--redistribute", action="store_true",
+                        help="Top-up or partial-close to match --target-usd on the given position")
+    parser.add_argument("--top-up", action="store_true",
+                        help="Add --amount-usd worth of liquidity to position")
+    parser.add_argument("--partial-close", action="store_true",
+                        help="Withdraw --amount-usd worth of liquidity from position")
+    parser.add_argument("--amount-usd", type=float, default=None,
+                        help="USD amount for --top-up / --partial-close")
     parser.add_argument("--compound-ratio", type=float, default=DEFAULT_COMPOUND_RATIO,
                         help=f"Max gas/fees ratio for --compound (default: {DEFAULT_COMPOUND_RATIO})")
     parser.add_argument("--hold", choices=["ETH","USDC"], default="USDC", help="Asset to hold on exit")
@@ -1455,6 +1693,26 @@ def main():
             print("ERROR: --position-id required"); return
         bot.compound_fees(args.position_id, args.fee, args.compound_ratio,
                           args.dry_run, args.yes)
+
+    elif args.redistribute:
+        if not args.position_id:
+            print("ERROR: --position-id required"); return
+        if args.target_usd is None or args.target_usd <= 0:
+            print("ERROR: --target-usd required and > 0"); return
+        bot.redistribute_to_target(args.position_id, args.target_usd, args.fee,
+                                    args.dry_run, args.yes)
+
+    elif args.top_up:
+        if not args.position_id or args.amount_usd is None:
+            print("ERROR: --position-id and --amount-usd required"); return
+        bot.top_up_position(args.position_id, args.amount_usd, args.fee,
+                             args.dry_run, args.yes)
+
+    elif args.partial_close:
+        if not args.position_id or args.amount_usd is None:
+            print("ERROR: --position-id and --amount-usd required"); return
+        bot.partial_close_position(args.position_id, args.amount_usd, args.fee,
+                                    args.dry_run, args.yes)
 
     else:
         parser.print_help()
