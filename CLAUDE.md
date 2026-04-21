@@ -76,3 +76,17 @@ git pull
 ./install.sh
 # Data in ~/.local/share/lp-ranger/ is preserved
 ```
+
+## Raspberry Pi deployment (headless 24/7)
+`lp_daemon.py` runs standalone on a Pi Zero 2 W (or any aarch64 SBC) with no GUI. Set up:
+```bash
+# On the Pi (Raspberry Pi OS Lite 64-bit, SSH enabled):
+git clone <repo-url> lp-ranger && cd lp-ranger
+sudo bash scripts/setup_pi.sh
+```
+The installer copies the repo to `/opt/lp-ranger`, installs `web3`/`cryptography` (aarch64 wheels, no compilation), prompts for the keystore + unlock password, writes them to `~/.lp-password` mode 600, and enables `lp-ranger.service` (systemd — restarts on crash, MemoryMax=200M). Keystore copied from the laptop with `scp ~/.local/share/lp-ranger/.keystore.enc pi@<ip>:~/.local/share/lp-ranger/` works too.
+
+### Multi-host coordination (laptop + Pi, same wallet)
+Both can run simultaneously against the same wallet. The blockchain is the source of truth — no inter-process protocol needed. When the laptop GUI rebalances (mints a new NFT) or adds capital, the daemon detects the change on its next poll via `lp_autobot.find_active_weth_usdc_position(address)` (ERC721Enumerable scan: `balanceOf` + `tokenOfOwnerByIndex` + `positions` filtered to WETH/USDC with `liquidity > 0`). Resync cadence = `POSITION_SYNC_SECONDS` (5 min). Strategy changes still require editing the strategy JSON and restarting the service on the Pi.
+
+Disable with `--no-autodiscover` if you want to pin the daemon to a specific `--position-id`.

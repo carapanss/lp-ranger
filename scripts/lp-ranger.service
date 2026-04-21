@@ -1,0 +1,44 @@
+[Unit]
+Description=LP Ranger — Uniswap V3 WETH/USDC autonomous LP daemon (Base)
+Documentation=https://github.com/carapanss/lp-ranger
+After=network-online.target
+Wants=network-online.target
+# Don't hammer the RPC on a reboot loop; back off progressively.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Templated values — setup_pi.sh rewrites these at install time.
+User=__USER__
+Group=__USER__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=/usr/bin/python3 __INSTALL_DIR__/lp_daemon.py --password-file __PASSWORD_FILE__
+Restart=on-failure
+RestartSec=30
+# Do not restart if the daemon exits 0 (manual stop via systemctl).
+SuccessExitStatus=0
+
+# Write logs both to journald and to ~/.local/share/lp-ranger/daemon.log.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lp-ranger
+
+# Hardening — tight for a single-purpose headless box.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=__DATA_DIR__
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Cap memory so a runaway import can't OOM the Pi Zero 2 W (512 MB total).
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

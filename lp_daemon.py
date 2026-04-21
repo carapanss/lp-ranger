@@ -33,6 +33,12 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_FILE = DATA_DIR / "daemon.log"
 STATE_FILE = DATA_DIR / "daemon_state.json"
+DEFAULT_PASSWORD_FILE = Path.home() / ".lp-password"
+
+# How often to rescan the wallet for the current position NFT. The laptop GUI
+# can mint a new NFT by rebalancing out-of-band, so the daemon has to pick it
+# up instead of acting on the stale token id cached in state.
+POSITION_SYNC_SECONDS = 300
 
 _DEFAULT_RPCS = [
     "https://mainnet.base.org",
@@ -361,27 +367,50 @@ def daemon_loop(args):
     # again and the plaintext password is no longer in memory.
     password = None
     pk = None
+    wallet_addr = None
     if not args.dry_run:
-        if args.password_file and Path(args.password_file).exists():
-            with open(args.password_file) as f:
+        pw_path = Path(args.password_file) if args.password_file else DEFAULT_PASSWORD_FILE
+        if pw_path.exists():
+            with open(pw_path) as f:
                 password = f.read().strip()
             try:
-                os.chmod(args.password_file, 0o600)
+                os.chmod(pw_path, 0o600)
             except OSError:
                 pass
-            log("Password loaded from file")
+            log(f"Password loaded from {pw_path}")
         else:
             password = getpass.getpass("AutoBot unlock password: ")
         try:
             import lp_autobot
             pk = lp_autobot.decrypt_key(password)
-            log("Keystore unlocked; private key cached in memory for this session")
+            wallet_addr = lp_autobot.wallet_address_from_pk(pk)
+            log(f"Keystore unlocked — wallet {wallet_addr}")
         except Exception as e:
             log(f"FATAL: cannot unlock keystore: {e}", "ERROR")
             return
         finally:
             # Drop the plaintext password — we will only use the derived PK.
             password = None
+
+    # First-boot / laptop-rebalance auto-discovery: if we don't have a
+    # position id yet, or if the wallet now holds a different NFT, adopt it.
+    # Cheap two-eth_call probe, OK to run eagerly here.
+    if wallet_addr and not args.no_autodiscover:
+        try:
+            import lp_autobot
+            tid, pos = lp_autobot.find_active_weth_usdc_position(wallet_addr)
+            if tid is not None:
+                current = str(state.get("position_id") or "")
+                if current != str(tid):
+                    log(f"Auto-discovered active position {tid} (was {current or 'none'}) — adopting")
+                    state.set("position_id", str(tid))
+                    state.set("pool_active", True)
+                    state.set("hold_asset", None)
+            elif state.get("pool_active", True) and str(state.get("position_id") or ""):
+                log("No active WETH/USDC NFT in wallet — marking pool as closed")
+                state.set("pool_active", False)
+        except Exception as e:
+            log(f"Auto-discovery failed (non-fatal): {e}", "WARN")
 
     log("="*50)
     log(f"LP Ranger Daemon started")
@@ -402,7 +431,31 @@ def daemon_loop(args):
 
             state.add_price(price)
 
-            # 2. Fetch position when wall-clock elapsed exceeds interval (default 15 min).
+            # 2a. Rescan the wallet for the *current* NFT. If the laptop GUI
+            # minted a fresh position (rebalance → new tokenId) we adopt it
+            # here so the daemon keeps operating on the live pool.
+            if wallet_addr and not args.no_autodiscover:
+                last_sync = state.data.get("last_position_sync_ts", 0)
+                if (time.time() - last_sync) >= POSITION_SYNC_SECONDS:
+                    try:
+                        import lp_autobot
+                        tid, _ = lp_autobot.find_active_weth_usdc_position(wallet_addr)
+                        current = str(state.get("position_id") or "")
+                        if tid is not None and current != str(tid):
+                            log(f"Wallet now holds position {tid} (was {current or 'none'}) — resyncing")
+                            state.set("position_id", str(tid))
+                            state.set("pool_active", True)
+                            state.set("hold_asset", None)
+                            state.data["last_position_fetch_ts"] = 0  # force re-read below
+                        elif tid is None and state.get("pool_active", True) and current:
+                            log("Wallet no longer holds an active LP NFT — marking pool closed")
+                            state.set("pool_active", False)
+                    except Exception as e:
+                        log(f"Position sync failed (non-fatal): {e}", "WARN")
+                    state.data["last_position_sync_ts"] = time.time()
+                    state.save()
+
+            # 2b. Fetch position when wall-clock elapsed exceeds interval (default 15 min).
             pid = state.get("position_id")
             pos_interval = int(strategy.cfg.get("data_sources",{}).get("position_poll_interval_seconds", 900))
             last_pos_fetch = state.data.get("last_position_fetch_ts", 0)
@@ -572,10 +625,12 @@ if __name__ == "__main__":
     pa.add_argument("--with-claude", action="store_true", help="Use Claude Code for review")
     pa.add_argument("--auto-execute", action="store_true", help="Execute without Claude review")
     pa.add_argument("--dry-run", action="store_true", help="Log only, don't execute")
-    pa.add_argument("--password-file", help="File with AutoBot unlock password")
+    pa.add_argument("--password-file", help=f"File with AutoBot unlock password (default: {DEFAULT_PASSWORD_FILE})")
     pa.add_argument("--setup-vps", action="store_true", help="Show VPS setup instructions")
     pa.add_argument("--poll", type=int, default=300, help="Poll interval in seconds")
     pa.add_argument("--cooldown", type=int, default=14400, help="Cooldown between actions in seconds")
+    pa.add_argument("--no-autodiscover", action="store_true",
+                    help="Disable wallet-scan position auto-discovery (pin to --position-id)")
     args = pa.parse_args()
 
     if args.setup_vps:

@@ -308,11 +308,11 @@ def get_position(token_id):
         return None
     raw = r[2:]
     fields = [raw[i*64:(i+1)*64] for i in range(12)]
-    
+
     def to_int(h):
         v = int(h, 16)
         return v - 2**256 if v >= 2**255 else v
-    
+
     return {
         "token0": "0x" + fields[2][-40:],
         "token1": "0x" + fields[3][-40:],
@@ -321,6 +321,73 @@ def get_position(token_id):
         "tickUpper": to_int(fields[6]),
         "liquidity": int(fields[7], 16),
     }
+
+def find_active_weth_usdc_position(address):
+    """Scan the wallet for an open WETH/USDC Uniswap V3 position on Base.
+
+    Uses ERC721Enumerable on the NonfungiblePositionManager
+    (balanceOf + tokenOfOwnerByIndex). Filters to the WETH/USDC pair with
+    liquidity > 0 and returns the newest such position (highest token id).
+
+    Returns (token_id:int, pos:dict) or (None, None) if the wallet has none.
+    The daemon uses this to pick up new NFTs minted by the laptop after a
+    manual rebalance — the wallet only ever holds one LP at a time in this
+    app, so "newest with liq>0" is unambiguous.
+    """
+    if not address:
+        return None, None
+    addr = address.lower()
+    if addr.startswith("0x"):
+        addr = addr[2:]
+    addr_pad = addr.zfill(64)
+    # balanceOf(owner)
+    r = rpc_call(
+        "eth_call",
+        [{"to": POSITION_MANAGER, "data": "0x70a08231" + addr_pad}, "latest"],
+    )
+    if not r or r == "0x":
+        return None, None
+    count = int(r, 16)
+    if count <= 0:
+        return None, None
+
+    weth_l = WETH.lower()
+    usdc_l = USDC.lower()
+    candidates = []
+    for i in range(count):
+        idx = hex(i)[2:].zfill(64)
+        # tokenOfOwnerByIndex(owner, index)
+        r = rpc_call(
+            "eth_call",
+            [{"to": POSITION_MANAGER, "data": "0x2f745c59" + addr_pad + idx}, "latest"],
+        )
+        if not r or r == "0x":
+            continue
+        token_id = int(r, 16)
+        pos = get_position(token_id)
+        if not pos:
+            continue
+        pair = {pos["token0"].lower(), pos["token1"].lower()}
+        if weth_l not in pair or usdc_l not in pair:
+            continue
+        if pos["liquidity"] <= 0:
+            continue
+        candidates.append((token_id, pos))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0]
+
+def wallet_address_from_pk(pk):
+    """Derive the 0x-address from a hex private key without spinning up web3."""
+    try:
+        from eth_account import Account
+    except ImportError as e:
+        raise RuntimeError(
+            "Missing dependency 'eth_account' (ships with web3). "
+            "Install with: pip install web3 --break-system-packages"
+        ) from e
+    return Account.from_key(pk).address
 
 def tick_to_price(tick):
     """Convert tick to USDC/ETH price (for WETH/USDC pool)."""
