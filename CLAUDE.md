@@ -86,6 +86,108 @@ sudo bash scripts/setup_pi.sh
 ```
 The installer copies the repo to `/opt/lp-ranger`, installs `web3`/`cryptography` (aarch64 wheels, no compilation), prompts for the keystore + unlock password, writes them to `~/.lp-password` mode 600, and enables `lp-ranger.service` (systemd — restarts on crash, MemoryMax=200M). Keystore copied from the laptop with `scp ~/.local/share/lp-ranger/.keystore.enc pi@<ip>:~/.local/share/lp-ranger/` works too.
 
+### Tutorial paso a paso (Pi Zero 2 W, primera instalación)
+
+Asume: Pi Zero 2 W + microSD ≥16 GB + cargador oficial + cable Ethernet (vía el hub USB-OTG). Tiempo total: ~20 min.
+
+**1. Flashear la microSD (en el portátil)**
+
+- Descarga **Raspberry Pi Imager**: <https://www.raspberrypi.com/software/>
+- Inserta la microSD en el portátil (adaptador USB si hace falta).
+- En Imager:
+  - *Device*: Raspberry Pi Zero 2 W
+  - *Operating System* → *Raspberry Pi OS (other)* → **Raspberry Pi OS Lite (64-bit)**. ⚠️ El de 32-bit NO sirve: `web3` no tiene wheels precompiladas ahí.
+  - *Storage*: la microSD.
+- Antes de escribir, pulsa el engranaje (⚙️) para **personalizar**:
+  - Hostname: `lpranger` (opcional, facilita el SSH)
+  - Usuario + contraseña: crea un usuario (ej. `pi` / contraseña a tu gusto — esta SÍ la vas a necesitar, anótala)
+  - WiFi: SSID + contraseña de tu red + país (ES)
+  - Locale: zona horaria `Europe/Madrid`, teclado `es`
+  - **Services** → marca **Enable SSH** → *Use password authentication*
+- *Write*. Espera ~5 min. Al acabar, extrae la SD.
+
+**2. Primer arranque del Pi**
+
+- Mete la microSD en el Pi Zero 2 W.
+- Conecta el hub USB+Ethernet al puerto micro-USB de datos (el marcado `USB`, no el `PWR`) y el cable Ethernet al router.
+- Conecta el cargador al puerto `PWR`. El Pi arranca (LED verde).
+- Espera ~2 min al primer boot (se expande la partición + conecta a red).
+
+**3. Entrar por SSH desde el portátil**
+
+- Encuentra la IP: mira la tabla de DHCP de tu router, o prueba:
+  ```bash
+  ping lpranger.local
+  ```
+- Conecta:
+  ```bash
+  ssh pi@lpranger.local      # o ssh pi@<IP>
+  ```
+  Primera vez: acepta la huella (`yes`). Escribe la contraseña del paso 1.
+
+**4. Clonar el repo en el Pi**
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git
+git clone https://github.com/carapanss/lp-ranger.git
+cd lp-ranger
+```
+
+**5. Copiar el keystore desde el portátil (en otra terminal, en el portátil)**
+
+```bash
+scp ~/.local/share/lp-ranger/.keystore.enc pi@lpranger.local:/tmp/keystore.enc
+```
+
+**6. Correr el instalador (en el Pi)**
+
+```bash
+mkdir -p ~/.local/share/lp-ranger
+mv /tmp/keystore.enc ~/.local/share/lp-ranger/.keystore.enc
+sudo bash scripts/setup_pi.sh
+```
+
+El script:
+- Instala `python3`, `web3`, `cryptography` (wheels aarch64, ~2 min).
+- Copia el repo a `/opt/lp-ranger`.
+- Te pide la contraseña del keystore → la guarda en `~/.lp-password` modo 600.
+- Renderiza `/etc/systemd/system/lp-ranger.service` desde la plantilla.
+- Activa y arranca el servicio.
+
+**7. Verificar que funciona**
+
+```bash
+sudo systemctl status lp-ranger       # debe decir "active (running)"
+sudo journalctl -u lp-ranger -f       # ver el log en vivo — Ctrl+C para salir
+tail -f ~/.local/share/lp-ranger/daemon.log
+```
+
+En el log deberías ver:
+```
+[AutoBot] Keystore unlocked — wallet 0x...
+Auto-discovered active position 12345 — adopting
+🟢 ETH $2,350 | Range $2,200-$2,500 | green | trend +0.2% | RSI 55
+```
+
+### Operaciones comunes en el Pi
+
+```bash
+sudo systemctl restart lp-ranger              # tras editar una estrategia
+sudo systemctl stop lp-ranger                 # parar sin deshabilitar
+sudo systemctl start lp-ranger                # arrancar
+sudo journalctl -u lp-ranger -n 100 --no-pager   # últimas 100 líneas
+cd ~/lp-ranger && git pull && sudo bash scripts/setup_pi.sh   # actualizar
+```
+
+### Troubleshooting Pi
+
+- **`active (running)` pero no loggea nada en `daemon.log`:** el servicio está escribiendo a journald pero el directorio `~/.local/share/lp-ranger/` no es writable por el user del servicio. `ls -la ~/.local/share/lp-ranger` y fija permisos.
+- **`FATAL: cannot unlock keystore`:** la contraseña en `~/.lp-password` no coincide con la que encriptó el keystore. `echo -n 'tu-password' > ~/.lp-password && chmod 600 ~/.lp-password && sudo systemctl restart lp-ranger`.
+- **Falla `pip install web3` con compilación:** flasheaste la versión 32-bit por error. Vuelve al paso 1 con la 64-bit.
+- **No veo el Pi en la red:** el hub USB-OTG suele necesitar alimentación externa para Ethernet estable. Si el LED del puerto Ethernet no se enciende, el cargador oficial (5V/2.5A) lo soluciona en el 99% de los casos.
+- **RAM alta (>150 MB):** `sudo systemctl restart lp-ranger` una vez por semana vía cron si te preocupa. El daemon debería mantenerse en ~40-60 MB en régimen.
+
 ### Multi-host coordination (laptop + Pi, same wallet)
 Both can run simultaneously against the same wallet. The blockchain is the source of truth — no inter-process protocol needed. When the laptop GUI rebalances (mints a new NFT) or adds capital, the daemon detects the change on its next poll via `lp_autobot.find_active_weth_usdc_position(address)` (ERC721Enumerable scan: `balanceOf` + `tokenOfOwnerByIndex` + `positions` filtered to WETH/USDC with `liquidity > 0`). Resync cadence = `POSITION_SYNC_SECONDS` (5 min). Strategy changes still require editing the strategy JSON and restarting the service on the Pi.
 
