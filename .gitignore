@@ -27,3 +27,7 @@ last_decision.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code local notes (per-user session handoff, not shared)
+CLAUDE.local.md
+.claude/
