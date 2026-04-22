@@ -887,6 +887,18 @@ class MainWindow(Gtk.Window):
             self.mproj[key]=vv;gproj.attach(vb3,col,row,1,1)
         cproj.pack_start(gproj,False,False,0)
         self.dash_box.pack_start(cproj,False,False,0)
+        # Auto-execute toggle card
+        cae=_card()
+        aehb=Gtk.Box(spacing=8)
+        self.lbl_ae=_lbl("🤖 Auto-ejecución: ACTIVA","mv-sm")
+        aehb.pack_start(self.lbl_ae,True,True,0)
+        self.btn_ae=Gtk.Button(label="Pausar")
+        self.btn_ae.get_style_context().add_class("btn-r")
+        self.btn_ae.connect("clicked",self._toggle_auto_execute)
+        aehb.pack_start(self.btn_ae,False,False,0)
+        cae.pack_start(aehb,False,False,0)
+        cae.pack_start(_lbl("Pausa para no interferir con el bot del Pi","sub"),False,False,2)
+        self.dash_box.pack_start(cae,False,False,0)
         self.rec_frame=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=6);self.rec_frame.set_no_show_all(True)
         self.dash_box.pack_start(self.rec_frame,False,False,0)
         sc1=Gtk.ScrolledWindow();sc1.set_policy(Gtk.PolicyType.NEVER,Gtk.PolicyType.AUTOMATIC);sc1.add(self.dash_box)
@@ -1266,6 +1278,19 @@ class MainWindow(Gtk.Window):
         v=max(0.0,total-effective_reserve-0.50)  # +$0.50 for rounding/slippage
         self.e_target.set_text(f"{v:.2f}")
         self.app.term.wl(f"Sugerido: ${v:,.2f}  (reservando {reserve_eth:.4f} ETH ≈ ${reserve_usd:.2f} para gas)","blue")
+    def _toggle_auto_execute(self,btn):
+        self.app.auto_execute_enabled=not self.app.auto_execute_enabled
+        if self.app.auto_execute_enabled:
+            self.lbl_ae.set_text("🤖 Auto-ejecución: ACTIVA")
+            self.btn_ae.set_label("Pausar")
+            self.btn_ae.get_style_context().remove_class("btn-g")
+            self.btn_ae.get_style_context().add_class("btn-r")
+        else:
+            self.lbl_ae.set_text("⏸ Auto-ejecución: PAUSADA")
+            self.btn_ae.set_label("Reanudar")
+            self.btn_ae.get_style_context().remove_class("btn-r")
+            self.btn_ae.get_style_context().add_class("btn-g")
+
     def _set_range(self,btn):
         try:
             lo=float(self.e_lo.get_text());hi=float(self.e_hi.get_text())
@@ -1297,6 +1322,7 @@ class App:
         self._last_fee_time=0  # Track when we last added fees
         self._last_compound_try=0  # Track last opportunistic compound attempt
         self._compound_in_flight=False
+        self.auto_execute_enabled=True  # can be toggled from the dashboard
         if AppIndicator3:
             self.ind=AppIndicator3.Indicator.new("lp-ranger",str(ICONS_DIR/"gray.png"),AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
             self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
@@ -1424,13 +1450,14 @@ class App:
                 except Exception:
                     pass
                 # AUTO-EXECUTE if credentials are cached (prefer derived PK)
-                if self.term and (self.term._cached_pk or self.term._cached_pw):
+                if self.term and (self.term._cached_pk or self.term._cached_pw) and self.auto_execute_enabled:
                     self._auto_execute(rec, det)
         # Opportunistic compound: when in-range and no pending action, try once
         # per hour to reinvest fees — lp_autobot only fires the tx when the gas
         # cost is <= 1% of the uncollected fees, so tiny claims are skipped.
         if (not rec and status in ("green","yellow") and self.term
                 and (self.term._cached_pk or self.term._cached_pw)
+                and self.auto_execute_enabled
                 and not self._compound_in_flight
                 and time.time()-self._last_compound_try>=3600):
             self._last_compound_try=time.time()
