@@ -664,6 +664,10 @@ class Term(Gtk.Box):
                 self.app.balances.set_address(self.app.wallet_address)
                 # Kick off a first balance fetch in the background.
                 threading.Thread(target=self.app._fetch_balances, daemon=True).start()
+                # Also self-heal position_id from on-chain. Covers both
+                # corrupted config (mis-parsed tokenId) and rebalances
+                # issued by the Pi daemon while the laptop was off.
+                threading.Thread(target=self.app._autodiscover_position, daemon=True).start()
             except Exception:
                 pass
             self.wl("Password OK — ejecutando...", "blue")
@@ -1297,6 +1301,9 @@ class App:
         return False
     def _poll(self):threading.Thread(target=self._fetch,daemon=True).start();return True
     def _poll_pos(self):
+        # Resync from on-chain first. Self-heals a corrupted config.
+        if self.wallet_address:
+            threading.Thread(target=self._autodiscover_position, daemon=True).start()
         pid=self.config.get("position_id")
         if pid:threading.Thread(target=self._fpos,args=(pid,),daemon=True).start()
         return True
@@ -1307,6 +1314,41 @@ class App:
     def _fetch_balances(self):
         self.balances.fetch(eth_price_usd=self.fetcher.price or 0)
         GLib.idle_add(self._update_win)
+    def _autodiscover_position(self):
+        """Scan the wallet for the real active WETH/USDC NFT and adopt it.
+
+        Handles two recovery cases:
+          1. A stale/corrupted position_id stored in config (e.g. a previous
+             mis-parse of the mint receipt). If the local id is impossibly
+             large (>2**64) we drop it before the scan.
+          2. A rebalance that happened elsewhere (Pi daemon) minted a new
+             NFT — we pick it up on the next tick.
+        """
+        if not self.wallet_address:
+            return
+        try:
+            import lp_autobot
+            stored = str(self.config.get("position_id", "") or "")
+            if stored:
+                try:
+                    if int(stored) >= 2**64:
+                        self.history.log("autodiscover", f"dropping bogus position_id {stored[:20]}…")
+                        self.config.set("position_id", "")
+                        stored = ""
+                except ValueError:
+                    pass
+            tid, _ = lp_autobot.find_active_weth_usdc_position(self.wallet_address)
+            if tid is not None and str(tid) != stored:
+                self.history.log("autodiscover", f"adopting on-chain position {tid}")
+                self.config.set("position_id", str(tid))
+                # Range will refresh on the next _fpos tick.
+                if self.term:
+                    GLib.idle_add(self.term.wl,
+                        f"Posicion activa detectada on-chain: {tid}", "blue")
+        except Exception as e:
+            # Non-fatal — we'll retry next poll.
+            try: self.history.log("autodiscover_err", str(e)[:200])
+            except Exception: pass
     def _fpos(self,pid):
         self.fetcher.fetch_position(pid)
         if self.fetcher.pos:GLib.idle_add(self._apos)
@@ -1458,9 +1500,19 @@ class App:
                     import re as _re
                     m = _re.search(r'tokenId:\s*(\d+)', output)
                     if m:
-                        new_pid = m.group(1)
-                        GLib.idle_add(self.term.wl, f"  Nueva posicion ID: {new_pid}", "green")
-                        self.config.set("position_id", new_pid)
+                        candidate = m.group(1)
+                        # Sanity guard — real ids are small. If the autobot
+                        # ever prints a 78-digit number again (log-parse bug)
+                        # we reject and fall back to wallet auto-discovery.
+                        if int(candidate) >= 2**64:
+                            GLib.idle_add(self.term.wl,
+                                f"  ⚠️ tokenId parseado invalido ({candidate[:12]}…); usando auto-discovery",
+                                "orange")
+                            threading.Thread(target=self._autodiscover_position, daemon=True).start()
+                        else:
+                            new_pid = candidate
+                            GLib.idle_add(self.term.wl, f"  Nueva posicion ID: {new_pid}", "green")
+                            self.config.set("position_id", new_pid)
                     
                     # Update state
                     olo = self.config.get("range_lo",0); ohi = self.config.get("range_hi",0)

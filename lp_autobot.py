@@ -952,13 +952,52 @@ class TxBuilder:
         })
         tx_hash, receipt = self._send_and_wait(tx, "position opened", timeout=240)
 
-        # Extract tokenId from logs
+        # Extract tokenId from the PositionManager's ERC-721 Transfer log.
+        # Must NOT match by "any 4-topic log" — the Uniswap V3 pool's Mint
+        # event also has 4 topics and topic[3] there is the signed tickUpper
+        # (int24). Reading that as uint256 produces a bogus 2**256-offset
+        # id and breaks every subsequent operation on the position.
+        TRANSFER_SIG = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        ZERO_TOPIC = "0x" + "00" * 32
+        pm_addr = Web3.to_checksum_address(POSITION_MANAGER)
         new_token_id = None
         for log in receipt.get('logs', []):
-            if len(log.get('topics', [])) >= 4:
-                # Transfer event: topic[3] is tokenId
-                new_token_id = int(log['topics'][3].hex(), 16)
-                break
+            try:
+                log_addr = Web3.to_checksum_address(log.get('address', ''))
+            except Exception:
+                continue
+            if log_addr != pm_addr:
+                continue
+            topics = log.get('topics', [])
+            if len(topics) < 4:
+                continue
+            t0 = topics[0].hex() if hasattr(topics[0], 'hex') else str(topics[0])
+            t1 = topics[1].hex() if hasattr(topics[1], 'hex') else str(topics[1])
+            if t0.lower() != TRANSFER_SIG:
+                continue
+            # `from` must be the zero address for a mint. Without this guard
+            # any subsequent NFT transfer in the same tx would also match.
+            if int(t1, 16) != 0:
+                continue
+            tid_raw = topics[3].hex() if hasattr(topics[3], 'hex') else str(topics[3])
+            candidate = int(tid_raw, 16)
+            # Sanity: real NFT ids are small (< 2**64 in practice, ~10M today).
+            # If we ever see something huge, discard — this is almost always
+            # a mis-decoded signed tick.
+            if candidate <= 0 or candidate >= 2**64:
+                continue
+            new_token_id = candidate
+            break
+        if new_token_id is None:
+            print("  ⚠️  could not parse tokenId from mint receipt — "
+                  "will rely on wallet auto-discovery to recover")
+            try:
+                tid_auto, _ = find_active_weth_usdc_position(self.address)
+                if tid_auto is not None:
+                    new_token_id = tid_auto
+                    print(f"  ✓ auto-discovered tokenId from wallet: {new_token_id}")
+            except Exception as e:
+                print(f"  ⚠️  auto-discovery failed: {e}")
 
         # Revoke leftover allowances to the PositionManager.
         for tok in (pool_t0, pool_t1):
