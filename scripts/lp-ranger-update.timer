@@ -1,0 +1,14 @@
+[Unit]
+Description=LP Ranger — daily auto-update check
+Requires=lp-ranger-update.service
+
+[Timer]
+# Daily, 30 min after boot if missed, plus a 1 h jitter so 100 Pis don't
+# all hit GitHub at exactly 04:00.
+OnBootSec=10min
+OnUnitActiveSec=1d
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=LP Ranger — pull latest from git and reinstall
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/lp-ranger/scripts/lp-ranger-update.sh
+# Don't fail noisily if the network is briefly down at boot.
+SuccessExitStatus=0 1

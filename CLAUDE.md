@@ -177,7 +177,24 @@ sudo systemctl restart lp-ranger              # tras editar una estrategia
 sudo systemctl stop lp-ranger                 # parar sin deshabilitar
 sudo systemctl start lp-ranger                # arrancar
 sudo journalctl -u lp-ranger -n 100 --no-pager   # últimas 100 líneas
-cd ~/lp-ranger && git pull && sudo bash scripts/setup_pi.sh   # actualizar
+tail -f ~/.local/share/lp-ranger/daemon.log   # log completo (INFO+)
+tail -f ~/.local/share/lp-ranger/errors.log   # solo WARN/ERROR (1 MB × 3)
+lp-ack                                         # apagar LED tras un error
+lp-ack --tail                                  # + dump últimas 30 líneas
+systemctl list-timers lp-ranger-update         # próximo auto-update
+```
+
+### LED de error (Pi onboard)
+
+El LED verde `ACT` del Pi pasa a parpadear (200 ms on / 200 ms off) cuando el daemon emite cualquier log de nivel ERROR. El disparador es un archivo flag en `~/.local/share/lp-ranger/error.flag` que acumula una línea por error. Cuando lo ves parpadear desde casa, te conectas por SSH, corres `lp-ack` y el LED vuelve a su trigger por defecto (mmc0 activity). `scripts/setup_pi.sh` instala `lp-ack` en `/usr/local/bin/`. Sin hardware extra — desactivable con `--no-led` en el ExecStart.
+
+### Auto-update diario
+
+`scripts/lp-ranger-update.timer` corre `scripts/lp-ranger-update.sh` una vez al día (+ 10 min tras boot si se perdió el slot, + jitter aleatorio de hasta 1 h). El script hace `git fetch`, si hay commits nuevos hace `git pull --ff-only` (nunca merge/rebase automático — diverge ⇒ aborta), vuelve a correr `setup_pi.sh` para refrescar deps + el unit, y reinicia el servicio. Log en `~/.local/share/lp-ranger/update.log`. Si el pull falla (conflicto), queda escrito allí y se mandará a errors.log vía el próximo ciclo ERROR.
+
+Para actualizar manualmente sin esperar al timer:
+```bash
+sudo systemctl start lp-ranger-update.service
 ```
 
 ### Troubleshooting Pi

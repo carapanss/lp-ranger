@@ -22,6 +22,10 @@ PASSWORD_FILE="$PI_HOME/.lp-password"
 DATA_DIR="$PI_HOME/.local/share/lp-ranger"
 SERVICE_SRC="$(cd "$(dirname "$0")" && pwd)/lp-ranger.service"
 SERVICE_DST="/etc/systemd/system/lp-ranger.service"
+UPDATE_SVC_SRC="$(cd "$(dirname "$0")" && pwd)/lp-ranger-update.service"
+UPDATE_SVC_DST="/etc/systemd/system/lp-ranger-update.service"
+UPDATE_TIMER_SRC="$(cd "$(dirname "$0")" && pwd)/lp-ranger-update.timer"
+UPDATE_TIMER_DST="/etc/systemd/system/lp-ranger-update.timer"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 log()  { printf "\033[1;34m[lp-ranger]\033[0m %s\n" "$*"; }
@@ -118,8 +122,16 @@ sed \
   "$SERVICE_SRC" > "$SERVICE_DST"
 chmod 644 "$SERVICE_DST"
 
+log "Installing auto-update timer"
+install -m 644 "$UPDATE_SVC_SRC"   "$UPDATE_SVC_DST"
+install -m 644 "$UPDATE_TIMER_SRC" "$UPDATE_TIMER_DST"
+
+log "Installing lp-ack helper"
+install -m 755 "$(dirname "$SERVICE_SRC")/lp-ack" /usr/local/bin/lp-ack
+
 systemctl daemon-reload
 systemctl enable lp-ranger.service >/dev/null
+systemctl enable --now lp-ranger-update.timer >/dev/null
 
 if [[ -f "$KEYSTORE" && -f "$PASSWORD_FILE" ]]; then
   log "Starting lp-ranger.service..."
@@ -148,6 +160,10 @@ cat <<EOF
     sudo systemctl restart lp-ranger       # restart after config change
     sudo journalctl -u lp-ranger -f        # live systemd log
     tail -f $DATA_DIR/daemon.log           # app log
+    tail -f $DATA_DIR/errors.log           # errors-only log
+    lp-ack                                 # clear error flag, stop LED blink
+    lp-ack --tail                          # also dump last 30 error lines
+    systemctl list-timers lp-ranger-update # next auto-update check
 
   Auto-discovery is ON by default: when you rebalance from the laptop,
   the new NFT is picked up within POSITION_SYNC_SECONDS (5 min).

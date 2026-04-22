@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Acknowledge a daemon error: clear the LED-blink flag so the Pi's onboard
+# LED stops blinking. Print the contents of the flag (one line per error
+# raised since the last ack) so SSH triage shows what fired.
+set -euo pipefail
+
+DATA_DIR="${LP_DATA_DIR:-$HOME/.local/share/lp-ranger}"
+FLAG="$DATA_DIR/error.flag"
+ERR_LOG="$DATA_DIR/errors.log"
+
+if [[ -f "$FLAG" ]]; then
+  echo "── Errors since last ack ──────────────────────────────"
+  cat "$FLAG"
+  echo "───────────────────────────────────────────────────────"
+  rm -f "$FLAG"
+  echo "ack: error flag cleared. LED will return to default within ~2s."
+else
+  echo "ack: no pending errors."
+fi
+
+if [[ "${1:-}" == "--tail" ]]; then
+  echo
+  echo "── Last 30 lines of errors.log ────────────────────────"
+  tail -n 30 "$ERR_LOG" 2>/dev/null || echo "(errors.log empty)"
+fi

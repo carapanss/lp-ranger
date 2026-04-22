@@ -102,6 +102,18 @@ class Cfg:
         loaded = _load_json(CONFIG_FILE, {})
         if isinstance(loaded, dict):
             self.c.update(loaded)
+        # Sanity-drop impossible position ids before any UI sees them.
+        # Real Uniswap V3 NFT ids are tiny (<10M today). A 78-digit number
+        # is the classic signed-tick-decoded-as-uint256 mis-parse.
+        pid = str(self.c.get("position_id", "") or "")
+        if pid:
+            try:
+                if int(pid) >= 2**64:
+                    self.c["position_id"] = ""
+                    _write_json(CONFIG_FILE, self.c)
+            except ValueError:
+                self.c["position_id"] = ""
+                _write_json(CONFIG_FILE, self.c)
     def save(self): _write_json(CONFIG_FILE, self.c)
     def get(self,k,d=None): return self.c.get(k,d)
     def set(self,k,v): self.c[k]=v; self.save()
@@ -1361,6 +1373,10 @@ class App:
                 if self.term:
                     GLib.idle_add(self.term.wl,
                         f"Posicion activa detectada on-chain: {tid}", "blue")
+                # Keep the Config tab's Entry in sync so the user doesn't see
+                # the stale id sitting in the text box.
+                if self.window and getattr(self.window, "e_pid", None):
+                    GLib.idle_add(self.window.e_pid.set_text, str(tid))
         except Exception as e:
             # Non-fatal — we'll retry next poll.
             try: self.history.log("autodiscover_err", str(e)[:200])

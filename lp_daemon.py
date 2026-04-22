@@ -32,6 +32,8 @@ DATA_DIR = Path.home() / ".local" / "share" / "lp-ranger"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_FILE = DATA_DIR / "daemon.log"
+ERROR_LOG_FILE = DATA_DIR / "errors.log"
+ERROR_FLAG_FILE = DATA_DIR / "error.flag"
 STATE_FILE = DATA_DIR / "daemon_state.json"
 DEFAULT_PASSWORD_FILE = Path.home() / ".lp-password"
 
@@ -39,6 +41,10 @@ DEFAULT_PASSWORD_FILE = Path.home() / ".lp-password"
 # can mint a new NFT by rebalancing out-of-band, so the daemon has to pick it
 # up instead of acting on the stale token id cached in state.
 POSITION_SYNC_SECONDS = 300
+
+# Pi onboard LED. Bookworm exposes the green ACT LED at /sys/class/leds/ACT.
+# Some kernels expose it as 'led0' instead. We probe both.
+LED_CANDIDATES = ["/sys/class/leds/ACT", "/sys/class/leds/led0"]
 
 _DEFAULT_RPCS = [
     "https://mainnet.base.org",
@@ -57,8 +63,106 @@ COOLDOWN_SECONDS = 14400  # 4 hours between actions
 MAX_ACTIONS_PER_DAY = 3   # Safety: max 3 rebalances per day
 
 # ============================================================
+# PI LED INDICATOR
+# ============================================================
+# Background thread that blinks the onboard ACT LED (heartbeat pattern,
+# 200 ms on / 200 ms off) whenever ERROR_FLAG_FILE exists. The flag is
+# set automatically by the ERROR-level log handler. The user clears it
+# over SSH with `lp-ack` (scripts/lp-ack), which deletes the flag and
+# restores the LED's default trigger.
+import threading
+
+def _find_led_dir():
+    for p in LED_CANDIDATES:
+        if Path(p).exists() and (Path(p) / "brightness").exists():
+            return Path(p)
+    return None
+
+def _led_write(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except (OSError, PermissionError):
+        return False
+
+class _LedBlinker(threading.Thread):
+    """Blinks the Pi ACT LED while ERROR_FLAG_FILE is present.
+
+    Saves and restores the original trigger so non-error operation looks
+    identical to a fresh Pi (mmc0 activity flicker).
+    """
+    def __init__(self):
+        super().__init__(daemon=True, name="lp-led")
+        self.led = _find_led_dir()
+        self._orig_trigger = None
+        self._stop = threading.Event()
+
+    def _read_trigger(self):
+        try:
+            with open(self.led / "trigger") as f:
+                # File looks like: "[mmc0] none heartbeat ..."; bracketed = active.
+                tokens = f.read().split()
+            for tok in tokens:
+                if tok.startswith("[") and tok.endswith("]"):
+                    return tok[1:-1]
+        except OSError:
+            pass
+        return "mmc0"  # safe default on Pi
+
+    def _enter_blink_mode(self):
+        _led_write(self.led / "trigger", "none")
+        _led_write(self.led / "brightness", "0")
+
+    def _restore(self):
+        _led_write(self.led / "trigger", self._orig_trigger or "mmc0")
+
+    def run(self):
+        if self.led is None:
+            return  # not on a Pi (or LED not exposed) — no-op silently
+        self._orig_trigger = self._read_trigger()
+        blinking = False
+        try:
+            while not self._stop.is_set():
+                if ERROR_FLAG_FILE.exists():
+                    if not blinking:
+                        self._enter_blink_mode()
+                        blinking = True
+                    _led_write(self.led / "brightness", "1")
+                    time.sleep(0.2)
+                    _led_write(self.led / "brightness", "0")
+                    time.sleep(0.2)
+                else:
+                    if blinking:
+                        self._restore()
+                        blinking = False
+                    time.sleep(2)
+        finally:
+            if blinking:
+                self._restore()
+
+    def stop(self):
+        self._stop.set()
+
+
+def _raise_error_flag(msg):
+    """Set the LED-blink flag and append a one-line entry with timestamp."""
+    try:
+        ERROR_FLAG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(ERROR_FLAG_FILE, "a") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')}  {msg}\n")
+    except OSError:
+        pass
+
+# ============================================================
 # LOGGING
 # ============================================================
+class _ErrorFlagHandler(logging.Handler):
+    """logging handler — every ERROR triggers the LED-blink flag."""
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            _raise_error_flag(record.getMessage())
+
 _LOGGER = logging.getLogger("lp_daemon")
 if not _LOGGER.handlers:
     _LOGGER.setLevel(logging.INFO)
@@ -68,8 +172,15 @@ if not _LOGGER.handlers:
     _fh.setFormatter(_fmt)
     _ch = logging.StreamHandler()
     _ch.setFormatter(_fmt)
+    # Dedicated errors-only log so SSHing in for triage doesn't require
+    # grep'ing through 25 MB of INFO chatter.
+    _eh = RotatingFileHandler(ERROR_LOG_FILE, maxBytes=1*1024*1024, backupCount=3)
+    _eh.setLevel(logging.WARNING)
+    _eh.setFormatter(_fmt)
     _LOGGER.addHandler(_fh)
     _LOGGER.addHandler(_ch)
+    _LOGGER.addHandler(_eh)
+    _LOGGER.addHandler(_ErrorFlagHandler())
 
 _LEVEL_MAP = {"INFO": logging.INFO, "WARN": logging.WARNING,
               "WARNING": logging.WARNING, "ERROR": logging.ERROR,
@@ -359,6 +470,16 @@ def daemon_loop(args):
     strategy_path = args.strategy or str(APP_DIR / "strategy_exit_pool.json")
     strategy = Strategy(strategy_path)
 
+    # Start the LED blinker (Pi only; no-op elsewhere). Background thread.
+    led_thread = None
+    if not args.no_led:
+        led_thread = _LedBlinker()
+        if led_thread.led is not None:
+            led_thread.start()
+            log(f"LED blinker armed on {led_thread.led}")
+        else:
+            log("No /sys/class/leds/ACT — LED indicator disabled (not on a Pi?)")
+
     if args.position_id:
         state.set("position_id", args.position_id)
 
@@ -631,6 +752,8 @@ if __name__ == "__main__":
     pa.add_argument("--cooldown", type=int, default=14400, help="Cooldown between actions in seconds")
     pa.add_argument("--no-autodiscover", action="store_true",
                     help="Disable wallet-scan position auto-discovery (pin to --position-id)")
+    pa.add_argument("--no-led", action="store_true",
+                    help="Disable the Pi onboard LED error indicator")
     args = pa.parse_args()
 
     if args.setup_vps:
