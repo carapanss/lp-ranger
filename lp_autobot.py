@@ -1677,8 +1677,16 @@ class TxBuilder:
 # ============================================================
 # CLI INTERFACE
 # ============================================================
+def _derive_key_from_mnemonic(phrase):
+    """Derive the first ETH account (BIP44 m/44'/60'/0'/0/0) from a BIP39 mnemonic."""
+    from eth_account import Account
+    Account.enable_unaudited_hdwallet_features()
+    acct = Account.from_mnemonic(phrase.strip(), account_path="m/44'/60'/0'/0/0")
+    return "0x" + acct.key.hex(), acct.address
+
+
 def setup_key():
-    """Interactive setup: import and encrypt private key."""
+    """Interactive setup: import and encrypt private key or recovery phrase."""
     print("="*50)
     print("LP Ranger AutoBot — Key Setup")
     print("="*50)
@@ -1689,22 +1697,50 @@ def setup_key():
     print("  • Your private key will be encrypted with a password")
     print("  • The key is NEVER stored in plaintext")
     print()
-    
-    pk = getpass.getpass("Enter private key (0x...): ").strip()
-    if not pk.startswith("0x"):
-        pk = "0x" + pk
-    if len(pk) != 66:
-        print("ERROR: Invalid private key length")
+    print("Import options:")
+    print("  1) Recovery phrase (12 or 24 words)")
+    print("  2) Private key (0x…)")
+    print()
+
+    choice = input("Choice [1/2]: ").strip()
+
+    if choice == "1":
+        phrase = getpass.getpass("Enter recovery phrase (words separated by spaces): ").strip()
+        words = phrase.split()
+        if len(words) not in (12, 15, 18, 21, 24):
+            print(f"ERROR: Expected 12 or 24 words, got {len(words)}")
+            return
+        try:
+            pk, address = _derive_key_from_mnemonic(phrase)
+        except Exception as e:
+            print(f"ERROR: Could not derive key from phrase — {e}")
+            print("Make sure the mnemonic package is installed:")
+            print("  /opt/lp-ranger/venv/bin/pip install mnemonic")
+            return
+        print(f"\nDerived address: {address}")
+        confirm = input("Is this the correct wallet? [y/N]: ").strip().lower()
+        if confirm != "y":
+            print("Aborted.")
+            return
+    elif choice == "2":
+        pk = getpass.getpass("Enter private key (0x...): ").strip()
+        if not pk.startswith("0x"):
+            pk = "0x" + pk
+        if len(pk) != 66:
+            print("ERROR: Invalid private key length")
+            return
+    else:
+        print("ERROR: Invalid choice")
         return
-    
+
     pw1 = getpass.getpass("Set encryption password: ")
     pw2 = getpass.getpass("Confirm password: ")
     if pw1 != pw2:
         print("ERROR: Passwords don't match")
         return
-    
+
     encrypt_key(pk, pw1)
-    
+
     # Verify
     try:
         from web3 import Web3
