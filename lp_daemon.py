@@ -483,6 +483,24 @@ def daemon_loop(args):
     if args.position_id:
         state.set("position_id", args.position_id)
 
+    # Auto-detect wallet: if --dry-run was set but the shared wallet directory
+    # now has both a keystore and a password file, upgrade to auto-execute
+    # automatically.  This lets the web UI trigger the switch to live mode
+    # simply by setting up the wallet and restarting the bot — no service-file
+    # edit required.
+    _WALLET_KEYSTORE = Path("/var/lib/lp-ranger/wallet/.local/share/lp-ranger/.keystore.enc")
+    _WALLET_PASSWORD = Path("/var/lib/lp-ranger/wallet/password")
+    if args.dry_run and _WALLET_KEYSTORE.exists() and _WALLET_PASSWORD.exists():
+        log("Wallet detected in /var/lib/lp-ranger/wallet — upgrading to auto-execute mode")
+        args.dry_run = False
+        if not args.password_file:
+            args.password_file = str(_WALLET_PASSWORD)
+        # Ensure the per-bot .local/share/lp-ranger/ dir has the keystore
+        _bot_ks = Path.home() / ".local" / "share" / "lp-ranger" / ".keystore.enc"
+        if not _bot_ks.exists():
+            _bot_ks.parent.mkdir(parents=True, exist_ok=True)
+            _bot_ks.symlink_to(_WALLET_KEYSTORE)
+
     # Get password for autobot and derive the private key once, in-process.
     # After derivation we drop the password entirely so Scrypt never runs
     # again and the plaintext password is no longer in memory.

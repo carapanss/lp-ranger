@@ -1741,6 +1741,16 @@ def setup_key():
 
     encrypt_key(pk, pw1)
 
+    # Save password file next to the wallet home so the daemon can find it
+    # when run with HOME=/var/lib/lp-ranger/wallet.
+    pw_file = Path.home() / "password"
+    try:
+        pw_file.write_text(pw1)
+        pw_file.chmod(0o600)
+        print(f"  Password saved to: {pw_file}")
+    except Exception as e:
+        print(f"  (Password file not saved: {e})")
+
     # Verify
     try:
         from web3 import Web3
@@ -1752,10 +1762,71 @@ def setup_key():
     except ImportError:
         print(f"\n✓ Key stored. Install web3 to verify: pip install web3 --break-system-packages")
 
+
+def setup_key_noninteractive():
+    """Non-interactive setup for web UI / automation: reads JSON from stdin,
+    writes {ok, address} JSON to stdout.
+
+    stdin format: {"phrase": "word1 word2 ...", "password": "..."}
+    or:           {"private_key": "0x...", "password": "..."}
+    """
+    import json, sys as _sys
+    try:
+        data = json.load(_sys.stdin)
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"Invalid JSON: {e}"}))
+        return
+
+    phrase = data.get("phrase", "").strip()
+    pk_hex = data.get("private_key", "").strip()
+    password = data.get("password", "")
+
+    if not password:
+        print(json.dumps({"ok": False, "error": "password is required"}))
+        return
+
+    if phrase:
+        words = phrase.split()
+        if len(words) not in (12, 15, 18, 21, 24):
+            print(json.dumps({"ok": False, "error": f"Expected 12 or 24 words, got {len(words)}"}))
+            return
+        try:
+            pk, address = _derive_key_from_mnemonic(phrase)
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            return
+    elif pk_hex:
+        pk = pk_hex if pk_hex.startswith("0x") else "0x" + pk_hex
+        if len(pk) != 66:
+            print(json.dumps({"ok": False, "error": "Invalid private key length"}))
+            return
+        try:
+            from web3 import Web3
+            acct = Web3().eth.account.from_key(pk)
+            address = acct.address
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            return
+    else:
+        print(json.dumps({"ok": False, "error": "Provide phrase or private_key"}))
+        return
+
+    try:
+        encrypt_key(pk, password)
+        pw_file = Path.home() / "password"
+        pw_file.write_text(password)
+        pw_file.chmod(0o600)
+        print(json.dumps({"ok": True, "address": address}))
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="LP Ranger AutoBot")
     parser.add_argument("--setup", action="store_true", help="Import and encrypt private key")
+    parser.add_argument("--setup-noninteractive", action="store_true",
+                        help="Non-interactive setup: reads JSON from stdin, outputs JSON to stdout")
     parser.add_argument("--status", action="store_true", help="Show wallet and position status")
     parser.add_argument("--rebalance", action="store_true", help="Rebalance to new range")
     parser.add_argument("--exit", action="store_true", help="Exit pool")
@@ -1797,6 +1868,10 @@ def main():
 
     if args.setup:
         setup_key()
+        return
+
+    if args.setup_noninteractive:
+        setup_key_noninteractive()
         return
 
     # Unlock key. Preferred path: parent process has already decrypted the key
