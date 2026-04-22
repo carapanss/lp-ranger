@@ -679,6 +679,22 @@ class Term(Gtk.Box):
     def _exec(self, cmd, password=None):
         parts=cmd.split();verb=parts[0].lower() if parts else ""
         autobot=str(APP_DIR/"lp_autobot.py");pid=self.app.config.get("position_id","")
+        # Self-heal race: _autodiscover_position runs in a background thread
+        # when the keystore unlocks, but an auto-execute signal can fire on
+        # the same tick with pid="" (if we just nuked a bogus one). For
+        # commands that need a position id, run discovery inline before we
+        # hand the empty string to the autobot.
+        needs_pid = verb in ("rebalance", "exit", "partial-close",
+                             "top-up", "redistribute", "compound", "status")
+        if needs_pid and not pid and self.app.wallet_address:
+            try:
+                self.app._autodiscover_position()
+                pid = self.app.config.get("position_id", "")
+                if pid:
+                    GLib.idle_add(self.wl,
+                        f"  (auto-discovered position {pid})", "blue")
+            except Exception as e:
+                GLib.idle_add(self.wl, f"  auto-discovery error: {e}", "yellow")
         pk = self._cached_pk
         pw = password or self._cached_pw or ""
         try:
@@ -1444,7 +1460,20 @@ class App:
         pw = self.term._cached_pw
         autobot = str(APP_DIR / "lp_autobot.py")
 
-        if not pid:
+        # Same race guard as TermTab._exec: if the config was just wiped by
+        # the bogus-tokenId sanity check, resolve the real id on-chain before
+        # firing the action. Only rebalance/exit need a pid; enter_pool
+        # explicitly does not (it mints fresh).
+        if rtype in ("rebalance", "exit_pool") and not pid and self.wallet_address:
+            try:
+                self._autodiscover_position()
+                pid = self.config.get("position_id","")
+                if pid:
+                    self.term.wl(f"  (auto-discovered position {pid})", "blue")
+            except Exception as e:
+                self.term.wl(f"  auto-discovery error: {e}", "yellow")
+
+        if rtype in ("rebalance", "exit_pool") and not pid:
             self.term.wl("Auto-exec: no hay Position ID configurado","red")
             return
 
