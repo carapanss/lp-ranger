@@ -19,6 +19,7 @@ from backtest.engine import run_backtest, precompute_indicators
 REPO = Path(__file__).resolve().parent.parent
 REPORTS_DIR = REPO / "backtest" / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+MAX_FAILURE_RATE = 0.10
 
 
 # ── Grid definitions ──────────────────────────────────────────────
@@ -116,11 +117,13 @@ def grid_search_one_window(candles_train):
     """
     best_by_type = {}
     failures = []
+    total_cfgs = 0
     # Cache indicators by (ema_fast, ema_slow, atr_period, rsi_period)
     ind_cache = {}
     for stype in GRIDS:
         best = None
         for cfg in _cfgs_for(stype):
+            total_cfgs += 1
             ic = cfg["data_sources"]["indicators"]
             key = (ic["ema_fast"], ic["ema_slow"], ic["atr_period"], ic["rsi_period"])
             if key not in ind_cache:
@@ -139,10 +142,11 @@ def grid_search_one_window(candles_train):
                 best = (cfg, r)
         if best is not None:
             best_by_type[stype] = best
-    return best_by_type, failures
+    return best_by_type, failures, total_cfgs
 
 
-def walk_forward(candles, *, train_days=180, test_days=30, step_days=30):
+def walk_forward(candles, *, train_days=180, test_days=30, step_days=30,
+                 max_failure_rate=MAX_FAILURE_RATE):
     """Roll forward through the candle stream. Returns a list[SearchResult],
     one per (strategy_type, test_window)."""
     if not candles:
@@ -165,7 +169,18 @@ def walk_forward(candles, *, train_days=180, test_days=30, step_days=30):
             print(f"  window {i+1}/{len(anchors)}: too few candles, skipping")
             continue
 
-        best_by_type, failures = grid_search_one_window(c_train)
+        best_by_type, failures, total_cfgs = grid_search_one_window(c_train)
+        failed_rate = (len(failures) / total_cfgs) if total_cfgs else 0.0
+        if failed_rate > max_failure_rate:
+            raise RuntimeError(
+                f"window {i+1}/{len(anchors)} aborted: {len(failures)}/{total_cfgs} "
+                f"configs failed ({failed_rate:.1%}), threshold={max_failure_rate:.1%}"
+            )
+        if len(best_by_type) != len(GRIDS):
+            missing = sorted(set(GRIDS) - set(best_by_type))
+            raise RuntimeError(
+                f"window {i+1}/{len(anchors)} aborted: no valid config for {', '.join(missing)}"
+            )
         for stype, (cfg, train_r) in best_by_type.items():
             test_r = run_backtest(cfg, c_test)
             results.append(SearchResult(
@@ -182,7 +197,7 @@ def walk_forward(candles, *, train_days=180, test_days=30, step_days=30):
                 test_rebalances=test_r.n_rebalances,
                 test_exits=test_r.n_exits,
             ))
-        fail_note = f" | failed_cfgs={len(failures)}" if failures else ""
+        fail_note = f" | failed_cfgs={len(failures)}/{total_cfgs}" if failures else ""
         print(f"  window {i+1}/{len(anchors)}: {time.time()-t0:.1f}s{fail_note} | "
               + " | ".join(f"{s}: train={b[1].net_apr:.0f}% test={run_backtest(b[0], c_test).net_apr:.0f}%"
                           for s,b in best_by_type.items()))
@@ -279,6 +294,7 @@ if __name__ == "__main__":
     ap.add_argument("--train-days", type=int, default=180)
     ap.add_argument("--test-days", type=int, default=30)
     ap.add_argument("--step-days", type=int, default=30)
+    ap.add_argument("--max-failure-rate", type=float, default=MAX_FAILURE_RATE)
     args = ap.parse_args()
 
     candles = fetch_eth_usd(days=args.days, cache_path=args.cache)
@@ -297,7 +313,8 @@ if __name__ == "__main__":
         results = walk_forward(candles,
                                train_days=args.train_days,
                                test_days=args.test_days,
-                               step_days=args.step_days)
+                               step_days=args.step_days,
+                               max_failure_rate=args.max_failure_rate)
         summary = summarise(results)
         csv_p, json_p = write_reports(results, summary)
         print(f"\nTop 10 by mean OOS APR:")

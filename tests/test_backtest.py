@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import lp_core
 from backtest.engine import run_backtest
 from backtest.search import (
-    GRIDS, _cfgs_for, slice_candles, summarise, walk_forward,
+    GRIDS, _cfgs_for, grid_search_one_window, slice_candles, summarise, walk_forward,
 )
 
 
@@ -123,3 +123,21 @@ def test_grid_size_bounded():
     # Total must fit 6 walk-forward windows in ~10 min
     total = n_exit + n_trend + n_fixed
     assert total < 10000
+
+
+def test_grid_search_reports_total_cfg_count():
+    best_by_type, failures, total_cfgs = grid_search_one_window(flat(days=30))
+    assert total_cfgs == sum(1 for stype in GRIDS for _ in _cfgs_for(stype))
+    assert set(best_by_type).issubset(set(GRIDS))
+    assert isinstance(failures, list)
+
+
+def test_walk_forward_fails_closed_when_too_many_cfgs_break(monkeypatch):
+    candles = flat(days=365)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("backtest.search.run_backtest", broken)
+    with pytest.raises(RuntimeError, match="failed"):
+        walk_forward(candles, max_failure_rate=0.0)

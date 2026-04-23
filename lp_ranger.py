@@ -476,55 +476,63 @@ class Strat:
     def _rsi(self,per=14): return lp_core.rsi(self._prices(), per)
     def evaluate(self,price,rlo,rhi,pool_active=True,hold=None):
         if price<=0:return "gray",None,{"message":"Esperando datos..."}
-        p=self.cfg.get("parameters",{});ic=self.cfg.get("data_sources",{}).get("indicators",{})
-        st=self.cfg.get("strategy_type","exit_pool")
-        warm=self._warm(ic)
-        ef=self._ema(ic.get("ema_fast",20));es=self._ema(ic.get("ema_slow",50))
-        atr=self._atr(ic.get("atr_period",14));rsi=self._rsi(ic.get("rsi_period",14))
-        vp=(atr/price*100) if (atr is not None and price>0) else 0
-        tu=(ef is not None and es is not None and ef>es)
-        tp=((ef-es)/es*100) if (ef is not None and es is not None and es>0) else 0
-        det={"in_range":False,"price":round(price,2),
-             "ema_fast":round(ef,2) if ef is not None else None,
-             "ema_slow":round(es,2) if es is not None else None,
-             "trend":("alcista" if tu else "bajista") if (ef is not None and es is not None) else "desconocida",
-             "trend_pct":round(tp,1),"volatility_pct":round(vp,2),
-             "rsi":round(rsi,1) if rsi is not None else None,
-             "atr":round(atr,2) if atr is not None else None,
-             "dist_lo_pct":0,"dist_hi_pct":0,"edge_dist_pct":0,"warming_up":not warm}
-        if not warm:
-            det["message"]=f"Calentando indicadores ({len(self.prices)} muestras)."
-            return "gray",None,det
-        if not pool_active:
-            h=hold or "USDC";det["message"]=f"Pool cerrada. Holding {h}."
-            nt=p.get("enter_trend_pct",2)
-            if abs(tp)<nt:
-                bw=p.get("base_width_pct",15);hw=bw/200;ts2=p.get("trend_shift",0.4)
-                sh=hw*ts2*min(abs(tp)/100*8,1);nc=price*(1+sh) if tu else price*(1-sh)
-                return f"closed_{h.lower()}",{"type":"enter_pool","lo":round(nc*(1-bw/200),2),"hi":round(nc*(1+bw/200),2),"width_pct":bw,"reason":f"Lateralizacion ({tp:+.1f}%). Re-entrar."},det
-            if h=="ETH" and rsi is not None and rsi<35:bw=p.get("base_width_pct",15);return f"closed_eth",{"type":"enter_pool","lo":round(price*(1-bw/200),2),"hi":round(price*(1+bw/200),2),"width_pct":bw,"reason":f"RSI {rsi:.0f}"},det
-            if h=="USDC" and rsi is not None and rsi>65:bw=p.get("base_width_pct",15);return f"closed_usdc",{"type":"enter_pool","lo":round(price*(1-bw/200),2),"hi":round(price*(1+bw/200),2),"width_pct":bw,"reason":f"RSI {rsi:.0f}"},det
-            return f"closed_{h.lower()}",None,det
-        if rlo<=0 or rhi<=0:det["message"]="Configura tu posicion.";return "gray",None,det
-        inr=rlo<=price<=rhi;det["in_range"]=inr;rw=rhi-rlo
-        if inr and rw>0:
-            det["dist_lo_pct"]=round((price-rlo)/price*100,1);det["dist_hi_pct"]=round((rhi-price)/price*100,1)
-            det["edge_dist_pct"]=round(min(price-rlo,rhi-price)/rw*100,1)
-        else:
-            det["dist_lo_pct"]=round((price-rlo)/price*100,1) if price>0 else 0
-            det["dist_hi_pct"]=round((rhi-price)/price*100,1) if price>0 else 0
-        if st=="exit_pool" and abs(tp)>p.get("exit_trend_pct",10):
-            h="ETH" if tp>0 else "USDC";r=f"Tendencia fuerte ({tp:+.1f}%). Cerrar pool, hold {h}."
-            det["message"]=r;return f"exit_{h.lower()}",{"type":"exit_pool","hold":h,"reason":r},det
-        buf=p.get("buffer_pct",5)/100
-        if not inr and (price<rlo*(1-buf) or price>rhi*(1+buf)):
-            bw=p.get("base_width_pct",15);ts2=p.get("trend_shift",0.4);hw=bw/200
-            sh=hw*ts2*min(abs(tp)/100*8,1);nc=price*(1+sh) if tu else price*(1-sh)
-            det["message"]="Fuera de rango. Rebalanceo necesario."
-            return "red",{"type":"rebalance","lo":round(nc*(1-bw/200),2),"hi":round(nc*(1+bw/200),2),"width_pct":bw,"reason":f"Buffer superado. Tendencia {det['trend']}."},det
-        if not inr:det["message"]=f"Fuera pero dentro del buffer.";return "yellow",None,det
-        if det.get("edge_dist_pct",100)<5:det["message"]=f"Cerca del borde ({det['edge_dist_pct']:.0f}%).";return "yellow",None,det
-        det["message"]="En rango. Posicion estable.";return "green",None,det
+        state={"range_lo":rlo,"range_hi":rhi,"pool_active":pool_active,"hold_asset":hold}
+        sig,action,core_det=lp_core.evaluate_strategy(self.cfg,price,state,self._prices())
+        det={
+            "in_range": bool(rlo and rhi and rlo <= price <= rhi),
+            "price": round(price,2),
+            "ema_fast": core_det.get("ema_fast"),
+            "ema_slow": core_det.get("ema_slow"),
+            "trend": {"up":"alcista","down":"bajista"}.get(core_det.get("trend"), "desconocida"),
+            "trend_pct": round(core_det.get("trend_pct",0),1),
+            "volatility_pct": round(core_det.get("vol",0),2),
+            "rsi": core_det.get("rsi"),
+            "atr": core_det.get("atr"),
+            "dist_lo_pct": 0,
+            "dist_hi_pct": 0,
+            "edge_dist_pct": core_det.get("edge_dist_pct",0),
+            "warming_up": core_det.get("warming_up",False),
+            "message": core_det.get("message",""),
+        }
+        if rlo>0 and rhi>0 and price>0:
+            rw=rhi-rlo
+            det["dist_lo_pct"]=round((price-rlo)/price*100,1)
+            det["dist_hi_pct"]=round((rhi-price)/price*100,1)
+            if det["in_range"] and rw>0:
+                det["edge_dist_pct"]=round(min(price-rlo,rhi-price)/rw*100,1)
+        mapped_action = action
+        if action and "width" in action and "width_pct" not in action:
+            mapped_action = dict(action)
+            mapped_action["width_pct"] = mapped_action["width"]
+        if sig == "gray":
+            if not pool_active and hold:
+                det["message"] = det.get("message") or f"Pool cerrada. Holding {hold}."
+            elif rlo<=0 or rhi<=0:
+                det["message"] = "Configura tu posicion."
+            elif det["warming_up"]:
+                det["message"] = f"Calentando indicadores ({len(self.prices)} muestras)."
+            return "gray", None, det
+        if sig == "green":
+            det["message"] = det.get("message") or "En rango. Posicion estable."
+            return "green", None, det
+        if sig == "yellow":
+            if not det["in_range"]:
+                det["message"] = det.get("message") or "Fuera pero dentro del buffer."
+            elif det.get("edge_dist_pct",100) < 5:
+                det["message"] = det.get("message") or f"Cerca del borde ({det['edge_dist_pct']:.0f}%)."
+            return "yellow", None, det
+        if sig == "rebalance":
+            det["message"] = det.get("message") or "Fuera de rango. Rebalanceo necesario."
+            return "red", mapped_action, det
+        if sig == "exit":
+            hold_asset = (mapped_action or {}).get("hold", "USDC")
+            det["message"] = det.get("message") or f"Tendencia fuerte. Cerrar pool, hold {hold_asset}."
+            return f"exit_{hold_asset.lower()}", mapped_action, det
+        if sig in ("enter", "closed"):
+            h = hold or "USDC"
+            det["message"] = det.get("message") or f"Pool cerrada. Holding {h}."
+            return f"closed_{h.lower()}", mapped_action, det
+        return "gray", None, det
 
 def parse_pid(t):
     t=t.strip()
