@@ -1,0 +1,22 @@
+[Unit]
+Description=LP Ranger daemon for position %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lp-ranger
+Environment=HOME=/var/lib/lp-ranger/bots/%i
+WorkingDirectory=/opt/lp-ranger
+ExecStart=/opt/lp-ranger/venv/bin/python /opt/lp-ranger/lp_daemon.py -p %i --shared-wallet-live --strategy /var/lib/lp-ranger/bots/%i/strategy.json
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lp-ranger/bots
+PrivateTmp=true
+MemoryMax=120M
+
+[Install]
+WantedBy=multi-user.target

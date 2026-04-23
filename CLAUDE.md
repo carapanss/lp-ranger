@@ -17,6 +17,8 @@
   - Files confirmed on the Pi: `/opt/lp-ranger/web/index.html`, `/opt/lp-ranger/web/lp_web.py`
   - Recovery status: the web files were copied back into the laptop repo under `web/` on `2026-04-23` so they can be versioned from now on.
   - The Pi also does not have a clone at `~/lp-ranger`; the live install is under `/opt/lp-ranger`.
+  - The per-position daemon on the Pi is a systemd template unit: `/etc/systemd/system/lp-daemon@.service`.
+  - Source-of-truth template for that unit now lives in the repo at `scripts/lp-daemon@.service`.
   - Operator constraint: interactions with the Pi must be driven from the laptop terminal over SSH; do not assume direct shell access on the Pi outside that path.
   - Product constraint: keep the Pi web UI lightweight and operationally focused. It runs alongside the daemon on constrained hardware, so prefer low-RSS, stdlib-first features that help monitoring/control without competing with the bot for RAM.
   - Resource intent: the Raspberry Pi deployment target is a Pi Zero 2 W class box (512 MB RAM). The bot must keep comfortable headroom. Avoid adding heavy web stacks, background workers, or browser-side complexity unless there is a strong operational reason.
@@ -24,6 +26,7 @@
   - Security hardening (`2026-04-23`): the Pi web dashboard now supports lightweight HTTP Basic Auth driven by `/var/lib/lp-ranger/web/password`. If that file is absent or empty, auth is effectively off and the UI should be treated as LAN-exposed admin tooling.
   - Web POST endpoints now perform a basic same-origin check (`Origin`/`Referer` vs `Host`) to reduce casual CSRF on authenticated sessions.
   - The web update flow now schedules a self-restart of `lp-web.service` after a successful install so dashboard code changes actually go live.
+  - Daemon startup hardening (`2026-04-23`): the Pi live bot should use the explicit `--shared-wallet-live` mode instead of relying on the old implicit `--dry-run` auto-promotion path.
 
 ## Overview
 Autonomous WETH/USDC liquidity pool manager for Uniswap V3 on Base chain. Detects signals, executes rebalances/exits/entries by signing on-chain transactions automatically.

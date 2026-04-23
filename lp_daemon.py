@@ -15,6 +15,9 @@ USAGE:
 
   # Dry run (log decisions but don't execute):
   python3 lp_daemon.py -p 4950738 --dry-run
+
+  # Raspberry Pi live mode via the shared unattended wallet:
+  python3 lp_daemon.py -p 4950738 --shared-wallet-live
 """
 
 import json, os, sys, math, time, subprocess, shutil, getpass, logging
@@ -36,6 +39,9 @@ ERROR_LOG_FILE = DATA_DIR / "errors.log"
 ERROR_FLAG_FILE = DATA_DIR / "error.flag"
 STATE_FILE = DATA_DIR / "daemon_state.json"
 DEFAULT_PASSWORD_FILE = Path.home() / ".lp-password"
+SHARED_WALLET_DIR = Path("/var/lib/lp-ranger/wallet")
+SHARED_WALLET_KEYSTORE = SHARED_WALLET_DIR / ".local" / "share" / "lp-ranger" / ".keystore.enc"
+SHARED_WALLET_PASSWORD = SHARED_WALLET_DIR / "password"
 
 # How often to rescan the wallet for the current position NFT. The laptop GUI
 # can mint a new NFT by rebalancing out-of-band, so the daemon has to pick it
@@ -483,23 +489,27 @@ def daemon_loop(args):
     if args.position_id:
         state.set("position_id", args.position_id)
 
-    # Auto-detect wallet: if --dry-run was set but the shared wallet directory
-    # now has both a keystore and a password file, upgrade to auto-execute
-    # automatically.  This lets the web UI trigger the switch to live mode
-    # simply by setting up the wallet and restarting the bot — no service-file
-    # edit required.
-    _WALLET_KEYSTORE = Path("/var/lib/lp-ranger/wallet/.local/share/lp-ranger/.keystore.enc")
-    _WALLET_PASSWORD = Path("/var/lib/lp-ranger/wallet/password")
-    if args.dry_run and _WALLET_KEYSTORE.exists() and _WALLET_PASSWORD.exists():
-        log("Wallet detected in /var/lib/lp-ranger/wallet — upgrading to auto-execute mode")
+    if args.shared_wallet_live:
+        if not SHARED_WALLET_KEYSTORE.exists() or not SHARED_WALLET_PASSWORD.exists():
+            missing = []
+            if not SHARED_WALLET_KEYSTORE.exists():
+                missing.append(str(SHARED_WALLET_KEYSTORE))
+            if not SHARED_WALLET_PASSWORD.exists():
+                missing.append(str(SHARED_WALLET_PASSWORD))
+            log(
+                "FATAL: shared-wallet live mode requested but missing: " + ", ".join(missing),
+                "ERROR",
+            )
+            return
         args.dry_run = False
         if not args.password_file:
-            args.password_file = str(_WALLET_PASSWORD)
-        # Ensure the per-bot .local/share/lp-ranger/ dir has the keystore
-        _bot_ks = Path.home() / ".local" / "share" / "lp-ranger" / ".keystore.enc"
-        if not _bot_ks.exists():
-            _bot_ks.parent.mkdir(parents=True, exist_ok=True)
-            _bot_ks.symlink_to(_WALLET_KEYSTORE)
+            args.password_file = str(SHARED_WALLET_PASSWORD)
+        # Keep lp_autobot's home-based keystore lookup working for each bot.
+        bot_keystore = Path.home() / ".local" / "share" / "lp-ranger" / ".keystore.enc"
+        if not bot_keystore.exists():
+            bot_keystore.parent.mkdir(parents=True, exist_ok=True)
+            bot_keystore.symlink_to(SHARED_WALLET_KEYSTORE)
+        log(f"Shared wallet live mode enabled via {SHARED_WALLET_DIR}")
 
     # Get password for autobot and derive the private key once, in-process.
     # After derivation we drop the password entirely so Scrypt never runs
@@ -764,6 +774,11 @@ if __name__ == "__main__":
     pa.add_argument("--with-claude", action="store_true", help="Use Claude Code for review")
     pa.add_argument("--auto-execute", action="store_true", help="Execute without Claude review")
     pa.add_argument("--dry-run", action="store_true", help="Log only, don't execute")
+    pa.add_argument(
+        "--shared-wallet-live",
+        action="store_true",
+        help="Run live using the Pi shared wallet in /var/lib/lp-ranger/wallet",
+    )
     pa.add_argument("--password-file", help=f"File with AutoBot unlock password (default: {DEFAULT_PASSWORD_FILE})")
     pa.add_argument("--setup-vps", action="store_true", help="Show VPS setup instructions")
     pa.add_argument("--poll", type=int, default=300, help="Poll interval in seconds")
