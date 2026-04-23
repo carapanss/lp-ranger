@@ -131,6 +131,27 @@ def write_error_ack(data_dir: Path, error_info: dict) -> None:
     }))
 
 
+def clear_bot_logs(bot_id: str) -> tuple[bool, str]:
+    data_dir = BOTS_DIR / bot_id / ".local" / "share" / "lp-ranger"
+    if not data_dir.is_dir():
+        return False, "bot not found"
+    cleared = []
+    for name in ("daemon.log", "errors.log", "error.flag"):
+        path = data_dir / name
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w"):
+                pass
+            cleared.append(name)
+        except OSError as e:
+            return False, f"clear {name} failed: {e}"
+    try:
+        _ack_file(data_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
+    return True, f"cleared: {', '.join(cleared)}"
+
+
 def read_state(bot_id: str) -> dict:
     data_dir = BOTS_DIR / bot_id / ".local" / "share" / "lp-ranger"
     state_file = data_dir / "daemon_state.json"
@@ -681,6 +702,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"ok": False, "error": f"ack write failed: {e}"})
                 return
             self._send_json(200, {"ok": True, "message": "error acknowledged", "has_unseen_error": False})
+            return
+
+        if path.startswith("/api/bots/") and path.endswith("/clear-log"):
+            bot_id = path[len("/api/bots/"):-len("/clear-log")]
+            if not bot_id.isdigit():
+                self._send_json(400, {"ok": False, "error": "invalid bot id"})
+                return
+            ok, msg = clear_bot_logs(bot_id)
+            if ok:
+                self._send_json(200, {"ok": True, "message": msg})
+            else:
+                self._send_json(500, {"ok": False, "error": msg})
             return
 
         if path.startswith("/api/bots/") and path.endswith("/start"):

@@ -403,7 +403,10 @@
 <div class="modal" id="modal">
   <header>
     <h2 id="modal-title">console</h2>
-    <button class="close" id="modal-close">close</button>
+    <div style="display:flex;gap:0.5rem;align-items:center">
+      <button class="close" id="modal-clear">clear log</button>
+      <button class="close" id="modal-close">close</button>
+    </div>
   </header>
   <pre id="modal-log"></pre>
   <div class="follow-bar">
@@ -455,6 +458,7 @@
   const MODAL_LOG = document.getElementById("modal-log");
   const MODAL_META = document.getElementById("modal-meta");
   const MODAL_CLOSE = document.getElementById("modal-close");
+  const MODAL_CLEAR = document.getElementById("modal-clear");
   const FOLLOW = document.getElementById("follow");
 
   let strategies = ["exit_pool", "v1", "aggressive"];
@@ -817,6 +821,25 @@
 
   MODAL_LOG.addEventListener("scroll", () => {
     FOLLOW.checked = isNearBottom(MODAL_LOG);
+  });
+
+  MODAL_CLEAR.addEventListener("click", async () => {
+    if (!openConsoleId) return;
+    if (!confirm("Clear current log for bot " + openConsoleId + "?")) return;
+    MODAL_CLEAR.disabled = true;
+    MODAL_CLEAR.textContent = "clearing…";
+    try {
+      await api(`/api/bots/${encodeURIComponent(openConsoleId)}/clear-log`, { method: "POST" });
+      MODAL_LOG.textContent = "";
+      MODAL_META.textContent = "log cleared";
+      await refreshAll();
+      await pollConsole();
+    } catch (e) {
+      MODAL_META.textContent = "clear failed: " + e.message;
+    } finally {
+      MODAL_CLEAR.disabled = false;
+      MODAL_CLEAR.textContent = "clear log";
+    }
   });
 
   // --- Click delegation (cards + modal close) ---
