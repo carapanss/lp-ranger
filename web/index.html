@@ -550,6 +550,7 @@
   // --- Renderers ---
   function runningCard(id, payload) {
     const st = payload.state || {};
+    const strategyName = payload.strategy_name || "exit_pool";
     const lastPrice = st.price_history && st.price_history.length
       ? st.price_history[st.price_history.length - 1].p
       : null;
@@ -564,6 +565,9 @@
     const ackButton = hasError
       ? `<button class="ghost" data-action="ack-error" data-id="${id}" title="mark error as seen">seen</button>`
       : "";
+    const stratOpts = strategies.map(s =>
+      `<option value="${s}"${s === strategyName ? " selected" : ""}>${s}</option>`
+    ).join("");
     return `
       <div class="hdr">
         <span>
@@ -580,10 +584,13 @@
         <dt>Last log</dt><dd>${fmtAgo(logAge)}</dd>
         <dt>Cooldown</dt><dd>${fmtDur(cooldownRemaining(st.last_action_time))}</dd>
         <dt>Pool</dt><dd>${esc(poolText)}</dd>
+        <dt>Strategy</dt><dd>${esc(strategyName)}</dd>
         <dt>Actions today</dt><dd>${st.actions_today || 0} / 3</dd>
       </dl>
       <pre class="mini-log">${renderLog(miniLines)}</pre>
       <div class="actions">
+        <select data-strategy="${id}">${stratOpts}</select>
+        <button class="ghost" data-action="set-strategy" data-id="${id}">apply strategy</button>
         <button data-action="console" data-id="${id}">full log</button>
         ${ackButton}
         <button class="danger" data-action="stop" data-id="${id}">stop</button>
@@ -594,8 +601,9 @@
 
   function positionCard(pos, running) {
     if (running) return null; // prefer runningCard when the bot is up
+    const strategyName = pos.strategy_name || "exit_pool";
     const stratOpts = strategies.map(s =>
-      `<option value="${s}"${s === "exit_pool" ? " selected" : ""}>${s}</option>`
+      `<option value="${s}"${s === strategyName ? " selected" : ""}>${s}</option>`
     ).join("");
     const liqBadge = pos.has_liquidity
       ? '<span class="tag live">has liquidity</span>'
@@ -885,6 +893,25 @@
         if (errEl) errEl.textContent = e.message || "start failed";
         btn.disabled = false;
         btn.textContent = "start as bot";
+      }
+      return;
+    }
+    if (action === "set-strategy") {
+      const select = document.querySelector(`select[data-strategy="${id}"]`);
+      const strategy = select ? select.value : "exit_pool";
+      btn.disabled = true;
+      btn.textContent = "applying…";
+      try {
+        await api(`/api/bots/${encodeURIComponent(id)}/strategy`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ strategy }),
+        });
+        await refreshAll();
+      } catch (e) {
+        if (errEl) errEl.textContent = e.message || "strategy update failed";
+        btn.disabled = false;
+        btn.textContent = "apply strategy";
       }
       return;
     }

@@ -171,6 +171,21 @@ def clear_bot_logs(bot_id: str) -> tuple[bool, str]:
     return True, f"cleared: {', '.join(cleared)}"
 
 
+def bot_strategy_name(bot_id: str) -> str | None:
+    strategy_file = BOTS_DIR / bot_id / "strategy.json"
+    try:
+        with strategy_file.open() as f:
+            content = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    known = {s["name"] for s in list_strategies()}
+    for key in ("name", "strategy_type"):
+        value = content.get(key)
+        if isinstance(value, str) and value in known:
+            return value
+    return None
+
+
 def diagnostics_text(bot_id: str) -> str:
     payload = read_state(bot_id)
     state = payload.get("state") or {}
@@ -245,6 +260,7 @@ def read_state(bot_id: str) -> dict:
         "log_tail": log_tail,
         "log_last_modified": log_mtime,
         "stale": stale,
+        "strategy_name": bot_strategy_name(bot_id),
         "latest_error": latest_error,
         "error_acknowledged": error_acknowledged,
         "has_unseen_error": bool(latest_error and not error_acknowledged),
@@ -878,6 +894,29 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = _systemctl("enable-now", bot_id)
             if ok:
                 self._send_json(200, {"ok": True, "message": msg or "started"})
+            else:
+                self._send_json(500, {"ok": False, "error": msg or "systemctl failed"})
+            return
+
+        if path.startswith("/api/bots/") and path.endswith("/strategy"):
+            bot_id = path[len("/api/bots/"):-len("/strategy")]
+            if not bot_id.isdigit():
+                self._send_json(400, {"ok": False, "error": "invalid bot id"})
+                return
+            body = self._read_json()
+            strategy = body.get("strategy", "exit_pool")
+            valid_names = {s["name"] for s in list_strategies()}
+            if strategy not in valid_names:
+                self._send_json(400, {"ok": False, "error": f"unknown strategy {strategy!r}"})
+                return
+            try:
+                seed_bot_dir(bot_id, strategy)
+            except Exception as e:  # noqa: BLE001
+                self._send_json(500, {"ok": False, "error": f"seed: {e}"})
+                return
+            ok, msg = _systemctl("restart", bot_id)
+            if ok:
+                self._send_json(200, {"ok": True, "message": msg or "strategy updated"})
             else:
                 self._send_json(500, {"ok": False, "error": msg or "systemctl failed"})
             return
