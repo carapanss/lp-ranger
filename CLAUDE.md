@@ -21,6 +21,9 @@
   - Product constraint: keep the Pi web UI lightweight and operationally focused. It runs alongside the daemon on constrained hardware, so prefer low-RSS, stdlib-first features that help monitoring/control without competing with the bot for RAM.
   - Resource intent: the Raspberry Pi deployment target is a Pi Zero 2 W class box (512 MB RAM). The bot must keep comfortable headroom. Avoid adding heavy web stacks, background workers, or browser-side complexity unless there is a strong operational reason.
   - Feature split: the desktop app can own richer/manual controls because it runs on the laptop. The Pi web UI should focus on remote monitoring, log inspection, lightweight controls, updates, and diagnostics rather than duplicating every desktop action.
+  - Security hardening (`2026-04-23`): the Pi web dashboard now supports lightweight HTTP Basic Auth driven by `/var/lib/lp-ranger/web/password`. If that file is absent or empty, auth is effectively off and the UI should be treated as LAN-exposed admin tooling.
+  - Web POST endpoints now perform a basic same-origin check (`Origin`/`Referer` vs `Host`) to reduce casual CSRF on authenticated sessions.
+  - The web update flow now schedules a self-restart of `lp-web.service` after a successful install so dashboard code changes actually go live.
 
 ## Overview
 Autonomous WETH/USDC liquidity pool manager for Uniswap V3 on Base chain. Detects signals, executes rebalances/exits/entries by signing on-chain transactions automatically.

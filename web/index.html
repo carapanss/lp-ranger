@@ -404,6 +404,7 @@
   <header>
     <h2 id="modal-title">console</h2>
     <div style="display:flex;gap:0.5rem;align-items:center">
+      <button class="close" id="modal-diagnostics">download diagnostics</button>
       <button class="close" id="modal-download">download log</button>
       <button class="close" id="modal-clear">clear log</button>
       <button class="close" id="modal-close">close</button>
@@ -459,6 +460,7 @@
   const MODAL_LOG = document.getElementById("modal-log");
   const MODAL_META = document.getElementById("modal-meta");
   const MODAL_CLOSE = document.getElementById("modal-close");
+  const MODAL_DIAGNOSTICS = document.getElementById("modal-diagnostics");
   const MODAL_DOWNLOAD = document.getElementById("modal-download");
   const MODAL_CLEAR = document.getElementById("modal-clear");
   const FOLLOW = document.getElementById("follow");
@@ -634,7 +636,7 @@
     try {
       const h = await api("/api/health");
       if (h.strategies && h.strategies.length) strategies = h.strategies;
-      META.textContent = `${h.hostname} · ${h.bots_count} bot${h.bots_count === 1 ? "" : "s"} · up ${fmtDur(h.uptime_seconds)}`;
+      META.textContent = `${h.hostname} · ${h.bots_count} bot${h.bots_count === 1 ? "" : "s"} · up ${fmtDur(h.uptime_seconds)}${h.auth_enabled ? " · auth on" : " · auth off"}`;
     } catch {
       META.textContent = "disconnected";
     }
@@ -847,6 +849,11 @@
   MODAL_DOWNLOAD.addEventListener("click", () => {
     if (!openConsoleId) return;
     window.open(`/api/bots/${encodeURIComponent(openConsoleId)}/download-log`, "_blank", "noopener");
+  });
+
+  MODAL_DIAGNOSTICS.addEventListener("click", () => {
+    if (!openConsoleId) return;
+    window.open(`/api/bots/${encodeURIComponent(openConsoleId)}/download-diagnostics`, "_blank", "noopener");
   });
 
   // --- Click delegation (cards + modal close) ---

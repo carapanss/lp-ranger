@@ -1552,8 +1552,10 @@ class TxBuilder:
 
         deadline = int(time.time()) + 600
         gas_price = self._gas_price()
+        a0_min = int(a0 * (1 - self.slippage)) if a0 > 0 else 0
+        a1_min = int(a1 * (1 - self.slippage)) if a1 > 0 else 0
         tx = self.pm.functions.increaseLiquidity((
-            token_id, a0, a1, 0, 0, deadline,  # mins=0: retail-scale dust risk only
+            token_id, a0, a1, a0_min, a1_min, deadline,
         )).build_transaction({
             'from': self.address, 'nonce': self._get_nonce(),
             'gas': 350000, 'gasPrice': gas_price,

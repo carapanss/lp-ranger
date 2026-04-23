@@ -115,6 +115,7 @@ def grid_search_one_window(candles_train):
     all param combos — amortises the O(n) sweep, giving ~50x speedup.
     """
     best_by_type = {}
+    failures = []
     # Cache indicators by (ema_fast, ema_slow, atr_period, rsi_period)
     ind_cache = {}
     for stype in GRIDS:
@@ -126,13 +127,19 @@ def grid_search_one_window(candles_train):
                 ind_cache[key] = precompute_indicators(candles_train, ic)
             try:
                 r = run_backtest(cfg, candles_train, indicators=ind_cache[key])
-            except Exception:
+            except Exception as e:
+                failures.append({
+                    "strategy_type": stype,
+                    "params": dict(cfg["parameters"]),
+                    "indicators": dict(ic),
+                    "error": str(e),
+                })
                 continue
             if best is None or r.net_apr > best[1].net_apr:
                 best = (cfg, r)
         if best is not None:
             best_by_type[stype] = best
-    return best_by_type
+    return best_by_type, failures
 
 
 def walk_forward(candles, *, train_days=180, test_days=30, step_days=30):
@@ -158,7 +165,7 @@ def walk_forward(candles, *, train_days=180, test_days=30, step_days=30):
             print(f"  window {i+1}/{len(anchors)}: too few candles, skipping")
             continue
 
-        best_by_type = grid_search_one_window(c_train)
+        best_by_type, failures = grid_search_one_window(c_train)
         for stype, (cfg, train_r) in best_by_type.items():
             test_r = run_backtest(cfg, c_test)
             results.append(SearchResult(
@@ -175,7 +182,8 @@ def walk_forward(candles, *, train_days=180, test_days=30, step_days=30):
                 test_rebalances=test_r.n_rebalances,
                 test_exits=test_r.n_exits,
             ))
-        print(f"  window {i+1}/{len(anchors)}: {time.time()-t0:.1f}s | "
+        fail_note = f" | failed_cfgs={len(failures)}" if failures else ""
+        print(f"  window {i+1}/{len(anchors)}: {time.time()-t0:.1f}s{fail_note} | "
               + " | ".join(f"{s}: train={b[1].net_apr:.0f}% test={run_backtest(b[0], c_test).net_apr:.0f}%"
                           for s,b in best_by_type.items()))
     return results

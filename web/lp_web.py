@@ -14,9 +14,11 @@ Design constraints:
 - Controls run narrowly-scoped systemctl via a dedicated sudoers drop-in.
 """
 import json
+import hmac
 import re
 import socket
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -29,6 +31,8 @@ HOST = "0.0.0.0"
 PORT = 8080
 BOTS_DIR = Path("/var/lib/lp-ranger/bots")
 USER_STRATEGIES_DIR = Path("/var/lib/lp-ranger/strategies")
+WEB_STATE_DIR = Path("/var/lib/lp-ranger/web")
+WEB_PASSWORD_FILE = WEB_STATE_DIR / "password"
 APP_DIR = Path("/opt/lp-ranger")
 INDEX_FILE = Path(__file__).parent / "index.html"
 
@@ -67,6 +71,21 @@ _start_time = time.time()
 # --- Bot state (local filesystem) ---
 
 ERROR_RE = re.compile(r"\[ERROR\]|FATAL")
+
+
+def auth_enabled() -> bool:
+    try:
+        return bool(WEB_PASSWORD_FILE.read_text().strip())
+    except OSError:
+        return False
+
+
+def _auth_password() -> str | None:
+    try:
+        password = WEB_PASSWORD_FILE.read_text().strip()
+    except OSError:
+        return None
+    return password or None
 
 def discover_bots() -> list[str]:
     if not BOTS_DIR.exists():
@@ -150,6 +169,44 @@ def clear_bot_logs(bot_id: str) -> tuple[bool, str]:
     except OSError:
         pass
     return True, f"cleared: {', '.join(cleared)}"
+
+
+def diagnostics_text(bot_id: str) -> str:
+    payload = read_state(bot_id)
+    state = payload.get("state") or {}
+    data_dir = BOTS_DIR / bot_id / ".local" / "share" / "lp-ranger"
+    errors_tail = tail_log(data_dir / "errors.log")
+    parts = [
+        f"bot_id: {bot_id}",
+        f"generated_at: {int(time.time())}",
+        f"stale: {payload.get('stale')}",
+        f"log_last_modified: {payload.get('log_last_modified')}",
+        f"has_unseen_error: {payload.get('has_unseen_error')}",
+        f"latest_error: {(payload.get('latest_error') or {}).get('line', '')}",
+        f"pool_active: {state.get('pool_active')}",
+        f"hold_asset: {state.get('hold_asset')}",
+        f"range_lo: {state.get('range_lo')}",
+        f"range_hi: {state.get('range_hi')}",
+        f"last_action_time: {state.get('last_action_time')}",
+        f"actions_today: {state.get('actions_today')}",
+        "",
+        "=== daemon.log tail ===",
+        *payload.get("log_tail", []),
+        "",
+        "=== errors.log tail ===",
+        *errors_tail,
+    ]
+    return "\n".join(parts).encode("utf-8", errors="replace")
+
+
+def _restart_web_service_async() -> None:
+    def _restart():
+        time.sleep(1.0)
+        subprocess.run(
+            ["sudo", "-n", "/usr/bin/systemctl", "restart", "lp-web.service"],
+            capture_output=True, text=True, timeout=30,
+        )
+    threading.Thread(target=_restart, daemon=True, name="lp-web-restart").start()
 
 
 def read_state(bot_id: str) -> dict:
@@ -550,6 +607,43 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_auth_required(self) -> None:
+        body = b"Authentication required"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="LP Ranger Pi"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _is_authenticated(self) -> bool:
+        password = _auth_password()
+        if not password:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return False
+        import base64
+        try:
+            decoded = base64.b64decode(header[6:]).decode("utf-8", errors="replace")
+        except Exception:
+            return False
+        _, _, supplied = decoded.partition(":")
+        return hmac.compare_digest(supplied, password)
+
+    def _csrf_ok(self) -> bool:
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            return True
+        for header_name in ("Origin", "Referer"):
+            value = self.headers.get(header_name)
+            if not value:
+                continue
+            parsed = urllib.parse.urlparse(value)
+            if parsed.netloc.lower() != host:
+                return False
+        return True
+
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0") or "0")
         if not length:
@@ -560,6 +654,9 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):  # noqa: N802
+        if not self._is_authenticated():
+            self._send_auth_required()
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
@@ -578,6 +675,7 @@ class Handler(BaseHTTPRequestHandler):
                 "bots_count": len(bots),
                 "hostname": socket.gethostname(),
                 "strategies": [s["name"] for s in list_strategies()],
+                "auth_enabled": auth_enabled(),
             })
             return
 
@@ -611,6 +709,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"ok": False, "error": f"log read failed: {e}"})
                 return
             self._send_text_download(f"lp-ranger-bot-{bot_id}.log", body)
+            return
+
+        if path.startswith("/api/bots/") and path.endswith("/download-diagnostics"):
+            bot_id = unquote(path[len("/api/bots/"):-len("/download-diagnostics")])
+            if not bot_id.isdigit():
+                self._send_json(400, {"ok": False, "error": "invalid bot id"})
+                return
+            if not (BOTS_DIR / bot_id).is_dir():
+                self._send_json(404, {"ok": False, "error": "bot not found"})
+                return
+            body = diagnostics_text(bot_id)
+            self._send_text_download(f"lp-ranger-bot-{bot_id}-diagnostics.txt", body)
             return
 
         if path == "/api/update/status":
@@ -650,6 +760,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):  # noqa: N802
+        if not self._is_authenticated():
+            self._send_auth_required()
+            return
+        if not self._csrf_ok():
+            self._send_json(403, {"ok": False, "error": "cross-site request blocked"})
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
@@ -693,6 +809,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Which bots were running at install time — client asks user to restart them.
                 status["affected_bots"] = discover_bots()
                 self._send_json(200, status)
+                _restart_web_service_async()
             except Exception as e:  # noqa: BLE001
                 self._send_json(500, {"ok": False, "error": str(e)})
             return
