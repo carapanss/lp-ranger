@@ -1,0 +1,1324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LP Ranger</title>
+<style>
+  :root {
+    --bg: #0e1218;
+    --card: #171e27;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --warn: #f0883e;
+    --good: #3fb950;
+    --bad: #f85149;
+    --border: #232b36;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); height: 100%; }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header {
+    padding: 0.8rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+  header .wallet-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex: 1;
+    max-width: 520px;
+  }
+  header input.wallet {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    padding: 0.4rem 0.7rem;
+    border-radius: 5px;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 0.8rem;
+  }
+  header input.wallet:focus { outline: none; border-color: var(--accent); }
+  header button.clear-wallet {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 0.35rem 0.6rem;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  header button.clear-wallet:hover { color: var(--fg); }
+  header .meta {
+    font-size: 0.8rem;
+    color: var(--muted);
+    font-family: "SF Mono", Menlo, monospace;
+    white-space: nowrap;
+  }
+  main { padding: 1.5rem; max-width: 1200px; margin: 0 auto; }
+  .section-label {
+    color: var(--muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin: 0 0 0.6rem 0.2rem;
+  }
+  .empty {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--muted);
+  }
+  .empty code {
+    display: inline-block;
+    margin-top: 0.7rem;
+    padding: 0.6rem 1rem;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.85rem;
+    color: var(--fg);
+  }
+  .grid {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+  }
+  .card .hdr {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.6rem;
+    gap: 0.4rem;
+  }
+  .card .pid {
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 1rem;
+    color: var(--accent);
+    margin-left: 0.3rem;
+  }
+  .card .emoji { font-size: 1.4rem; }
+  .card .tag {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    background: var(--border);
+    color: var(--muted);
+    letter-spacing: 0.05em;
+  }
+  .card .tag.stale  { background: transparent; color: var(--warn);  border: 1px solid var(--warn); }
+  .card .tag.live   { background: transparent; color: var(--good);  border: 1px solid var(--good); }
+  .card .tag.idle   { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  .card dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: 1rem;
+    row-gap: 0.3rem;
+    margin: 0.5rem 0;
+    font-size: 0.9rem;
+  }
+  .card dt { color: var(--muted); }
+  .card dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .card .actions {
+    margin-top: 0.7rem;
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .card button, .card select {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 0.35rem 0.7rem;
+    border-radius: 5px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .card button:hover, .card select:hover { border-color: var(--fg); }
+  .card button.primary { border-color: var(--accent); color: var(--accent); }
+  .card button.primary:hover { background: var(--accent); color: var(--bg); }
+  .card button.danger { border-color: var(--bad); color: var(--bad); }
+  .card button.danger:hover { background: var(--bad); color: var(--bg); }
+  .card button.ghost { color: var(--muted); }
+  .card button.ghost:hover { color: var(--fg); }
+  .card .err { color: var(--bad); font-size: 0.8rem; margin-top: 0.3rem; word-break: break-word; }
+
+  /* Console modal */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    display: none;
+    z-index: 100;
+  }
+  .modal-backdrop.open { display: block; }
+  .modal {
+    position: fixed;
+    inset: 3vh 3vw;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: none;
+    flex-direction: column;
+    z-index: 101;
+  }
+  .modal.open { display: flex; }
+  .modal > header {
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .modal > header h2 { margin: 0; font-size: 0.95rem; font-family: "SF Mono", Menlo, monospace; color: var(--accent); }
+  .modal > header .close {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 0.3rem 0.7rem;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .modal pre {
+    flex: 1;
+    margin: 0;
+    padding: 1rem;
+    overflow: auto;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 0.82rem;
+    line-height: 1.4;
+    color: var(--fg);
+    background: var(--bg);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .modal .follow-bar {
+    padding: 0.4rem 1rem;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 0.8rem;
+    align-items: center;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .modal .follow-bar label { cursor: pointer; }
+  .log-line { display: block; }
+  .log-error { color: #f87171; }
+  .log-warn  { color: #fbbf24; }
+  .log-action{ color: #60a5fa; }
+  .log-ok    { color: #4ade80; }
+  .mini-log  { margin-top: 0.5rem; padding: 0.4rem 0.6rem; background: #111; border-radius: 4px; font-family: "SF Mono", Menlo, monospace; font-size: 0.75rem; line-height: 1.5; max-height: 5.5rem; overflow: hidden; }
+
+  /* Collapsible empty-positions */
+  details.empty-box { margin-top: 1.5rem; }
+  details.empty-box summary {
+    cursor: pointer;
+    color: var(--muted);
+    padding: 0.5rem 0.2rem;
+    font-size: 0.85rem;
+    list-style: none;
+    user-select: none;
+  }
+  details.empty-box summary::-webkit-details-marker { display: none; }
+  details.empty-box summary::before {
+    content: "▸";
+    display: inline-block;
+    margin-right: 0.5rem;
+    transition: transform 0.15s;
+    font-family: "SF Mono", Menlo, monospace;
+  }
+  details.empty-box[open] summary::before { transform: rotate(90deg); }
+  details.empty-box summary:hover { color: var(--fg); }
+
+  /* Strategies button + modal */
+  header button.strategies {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 0.35rem 0.8rem;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.85rem;
+  }
+  header button.strategies:hover { color: var(--fg); border-color: var(--fg); }
+
+  .strategies-list {
+    flex: 0 0 240px;
+    border-right: 1px solid var(--border);
+    overflow: auto;
+  }
+  .strategies-list .item {
+    padding: 0.6rem 0.8rem;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .strategies-list .item:hover { background: var(--bg); }
+  .strategies-list .item.active { background: var(--bg); border-left: 2px solid var(--accent); padding-left: calc(0.8rem - 2px); }
+  .strategies-list .item .name { font-family: "SF Mono", Menlo, monospace; font-size: 0.85rem; color: var(--fg); }
+  .strategies-list .item .src {
+    font-size: 0.65rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .strategies-list .item .src.user { background: var(--accent); color: var(--bg); }
+  .strategies-list .item .src.builtin { color: var(--muted); border: 1px solid var(--border); }
+
+  .strategy-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .strategy-head {
+    padding: 0.8rem 1rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .strategy-head h3 { margin: 0; font-size: 0.95rem; font-family: "SF Mono", Menlo, monospace; color: var(--accent); }
+  .strategy-head .actions { display: flex; gap: 0.4rem; }
+  .strategy-head button {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 0.3rem 0.7rem;
+    border-radius: 5px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .strategy-head button:hover { border-color: var(--fg); }
+  .strategy-head button.primary { border-color: var(--accent); color: var(--accent); }
+  .strategy-head button.primary:hover { background: var(--accent); color: var(--bg); }
+  .strategy-head button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .strategy-content {
+    flex: 1;
+    overflow: auto;
+    padding: 1rem;
+  }
+  .strategy-content textarea {
+    width: 100%;
+    height: 100%;
+    min-height: 400px;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.7rem;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 0.85rem;
+    resize: vertical;
+  }
+
+  .beautify {
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 0.85rem;
+  }
+  .beautify .row {
+    display: grid;
+    grid-template-columns: 1fr 1.3fr;
+    column-gap: 1rem;
+    padding: 0.25rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .beautify .row:last-child { border-bottom: none; }
+  .beautify .key { color: var(--accent); }
+  .beautify .val { color: var(--fg); word-break: break-word; }
+  .beautify .val.string { color: #a5d6ff; }
+  .beautify .val.number { color: #79c0ff; }
+  .beautify .val.bool { color: var(--warn); }
+  .beautify .doc { color: var(--muted); font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 0.8rem; margin-top: 0.1rem; }
+  .beautify .group {
+    margin-top: 0.8rem;
+    padding-left: 0;
+  }
+  .beautify .group .group-title {
+    color: var(--muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.3rem;
+    padding-bottom: 0.2rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Modal layout override for strategies (two-pane) */
+  .modal.strategies-modal { flex-direction: column; }
+  .modal.strategies-modal .panes {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+  .upload-hint { color: var(--muted); font-size: 0.85rem; padding: 2rem; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🏊 LP Ranger</h1>
+  <div class="wallet-wrap">
+    <input class="wallet" id="wallet" placeholder="wallet address (0x…) — shows your positions" autocomplete="off" spellcheck="false">
+    <button class="clear-wallet" id="wallet-clear" title="clear wallet">×</button>
+  </div>
+  <button class="strategies" id="open-strategies">strategies</button>
+  <button class="strategies" id="open-updates">updates</button>
+  <div class="meta" id="meta">loading…</div>
+</header>
+
+<main id="main">
+  <div class="empty">loading…</div>
+</main>
+
+<div class="modal-backdrop" id="modal-backdrop"></div>
+
+<!-- Console modal -->
+<div class="modal" id="modal">
+  <header>
+    <h2 id="modal-title">console</h2>
+    <button class="close" id="modal-close">close</button>
+  </header>
+  <pre id="modal-log"></pre>
+  <div class="follow-bar">
+    <label><input type="checkbox" id="follow" checked> follow tail</label>
+    <span id="modal-meta"></span>
+  </div>
+</div>
+
+<!-- Updates modal -->
+<div class="modal" id="updates-modal">
+  <header>
+    <h2>Updates</h2>
+    <button class="close" id="updates-close">close</button>
+  </header>
+  <div class="strategy-content" id="updates-body" style="padding:1rem;overflow:auto">
+    <div class="upload-hint">loading…</div>
+  </div>
+</div>
+
+<!-- Strategies modal -->
+<div class="modal strategies-modal" id="strategies-modal">
+  <header>
+    <h2>Strategies</h2>
+    <div style="display:flex;gap:0.5rem;align-items:center">
+      <input type="file" id="strat-upload" accept="application/json,.json" style="display:none">
+      <button class="close" id="strat-upload-btn">upload new</button>
+      <button class="close" id="strat-close">close</button>
+    </div>
+  </header>
+  <div class="panes">
+    <div class="strategies-list" id="strat-list"></div>
+    <div class="strategy-body" id="strat-body">
+      <div class="upload-hint" id="strat-hint">Select a strategy on the left, or upload a new JSON file.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const STATUS_EMOJI_RE = /[🟢🟡🔴🚪🔄📦⚪]/g;
+  const COOLDOWN_SECONDS = 14400;
+  const MAIN = document.getElementById("main");
+  const META = document.getElementById("meta");
+  const WALLET_INPUT = document.getElementById("wallet");
+  const WALLET_CLEAR = document.getElementById("wallet-clear");
+  const MODAL = document.getElementById("modal");
+  const MODAL_BACKDROP = document.getElementById("modal-backdrop");
+  const MODAL_TITLE = document.getElementById("modal-title");
+  const MODAL_LOG = document.getElementById("modal-log");
+  const MODAL_META = document.getElementById("modal-meta");
+  const MODAL_CLOSE = document.getElementById("modal-close");
+  const FOLLOW = document.getElementById("follow");
+
+  let strategies = ["exit_pool", "v1", "aggressive"];
+  let openConsoleId = null;
+  let consoleTimer = null;
+  const LOG_FOLLOW_THRESHOLD = 24;
+
+  // --- Persistence ---
+  const savedWallet = localStorage.getItem("lp.wallet") || "";
+  WALLET_INPUT.value = savedWallet;
+
+  // --- Helpers ---
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  function lastEmoji(logTail) {
+    if (!logTail || !logTail.length) return "⚪";
+    for (let i = logTail.length - 1; i >= 0; i--) {
+      const m = logTail[i].match(STATUS_EMOJI_RE);
+      if (m && m.length) return m[0];
+    }
+    return "⚪";
+  }
+
+  function fmtAgo(secs) {
+    if (secs == null || secs < 0) return "—";
+    if (secs < 60) return Math.floor(secs) + "s ago";
+    if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+    if (secs < 86400) return Math.floor(secs / 3600) + "h ago";
+    return Math.floor(secs / 86400) + "d ago";
+  }
+
+  function fmtDur(secs) {
+    if (secs == null || secs <= 0) return "ready";
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    return h > 0 ? h + "h " + m + "m" : m + "m";
+  }
+
+  function fmtUSD(n) {
+    if (n == null || n === 0) return "—";
+    return "$" + Math.round(n).toLocaleString();
+  }
+
+  function fmtFee(fee) {
+    if (fee == null) return "—";
+    return (fee / 10000).toString() + "%";
+  }
+
+  function cooldownRemaining(lastActionTime) {
+    if (!lastActionTime) return null;
+    return COOLDOWN_SECONDS - ((Date.now() / 1000) - lastActionTime);
+  }
+
+  function isValidWallet(s) {
+    return /^0x[0-9a-fA-F]{40}$/.test(s || "");
+  }
+
+  function isNearBottom(el, threshold = LOG_FOLLOW_THRESHOLD) {
+    return (el.scrollHeight - el.clientHeight - el.scrollTop) <= threshold;
+  }
+
+  // --- API wrappers ---
+  async function api(path, opts) {
+    const r = await fetch(path, opts);
+    const txt = await r.text();
+    let data;
+    try { data = JSON.parse(txt); } catch { data = { ok: false, error: "bad json", raw: txt }; }
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    return data;
+  }
+
+  // --- Log rendering ---
+  function renderLog(lines) {
+    return (lines || []).map(line => {
+      const e = line.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+      let cls = "log-line";
+      if (/\[ERROR\]|ERROR|FATAL/.test(line)) cls += " log-error";
+      else if (/\[WARN\]|WARN/.test(line)) cls += " log-warn";
+      else if (/AUTO-EXEC|EJECUTANDO|rebalance|Rebalance|exit.*pool|EXIT|ENTER|upgrading to auto/.test(line)) cls += " log-action";
+      else if (/unlocked|started|✓|green|Keystore/.test(line)) cls += " log-ok";
+      return `<span class="${cls}">${e}</span>`;
+    }).join("\n");
+  }
+
+  // --- Renderers ---
+  function runningCard(id, payload) {
+    const st = payload.state || {};
+    const lastPrice = st.price_history && st.price_history.length
+      ? st.price_history[st.price_history.length - 1].p
+      : null;
+    const logAge = payload.log_last_modified
+      ? (Date.now() / 1000) - payload.log_last_modified
+      : null;
+    const poolText = st.pool_active === false
+      ? "📦 closed (" + (st.hold_asset || "?") + ")"
+      : "active";
+    const miniLines = (payload.log_tail || []).slice(-4);
+    const hasError = !!payload.has_unseen_error;
+    const ackButton = hasError
+      ? `<button class="ghost" data-action="ack-error" data-id="${id}" title="mark error as seen">seen</button>`
+      : "";
+    return `
+      <div class="hdr">
+        <span>
+          <span class="emoji">${lastEmoji(payload.log_tail)}</span>
+          <span class="pid">#${id}</span>
+          ${payload.stale ? '<span class="tag stale">stale</span>' : '<span class="tag live">running</span>'}
+          ${hasError ? '<span class="tag stale">error</span>' : ''}
+        </span>
+        <span class="tag">auto-execute</span>
+      </div>
+      <dl>
+        <dt>ETH</dt><dd>${fmtUSD(lastPrice)}</dd>
+        <dt>Range</dt><dd>${fmtUSD(st.range_lo)} – ${fmtUSD(st.range_hi)}</dd>
+        <dt>Last log</dt><dd>${fmtAgo(logAge)}</dd>
+        <dt>Cooldown</dt><dd>${fmtDur(cooldownRemaining(st.last_action_time))}</dd>
+        <dt>Pool</dt><dd>${esc(poolText)}</dd>
+        <dt>Actions today</dt><dd>${st.actions_today || 0} / 3</dd>
+      </dl>
+      <pre class="mini-log">${renderLog(miniLines)}</pre>
+      <div class="actions">
+        <button data-action="console" data-id="${id}">full log</button>
+        ${ackButton}
+        <button class="danger" data-action="stop" data-id="${id}">stop</button>
+      </div>
+      <div class="err" id="err-${id}"></div>
+    `;
+  }
+
+  function positionCard(pos, running) {
+    if (running) return null; // prefer runningCard when the bot is up
+    const stratOpts = strategies.map(s =>
+      `<option value="${s}"${s === "exit_pool" ? " selected" : ""}>${s}</option>`
+    ).join("");
+    const liqBadge = pos.has_liquidity
+      ? '<span class="tag live">has liquidity</span>'
+      : '<span class="tag idle">empty</span>';
+    return `
+      <div class="hdr">
+        <span>
+          <span class="emoji">💤</span>
+          <span class="pid">#${pos.id}</span>
+          ${liqBadge}
+        </span>
+        <span class="tag">${fmtFee(pos.fee)}</span>
+      </div>
+      <dl>
+        <dt>Range</dt><dd>${fmtUSD(pos.lo)} – ${fmtUSD(pos.hi)}</dd>
+        <dt>Pair</dt><dd>WETH / USDC</dd>
+      </dl>
+      <div class="actions">
+        <select data-strategy="${pos.id}">${stratOpts}</select>
+        <button class="primary" data-action="start" data-id="${pos.id}">start as bot</button>
+      </div>
+      <div class="err" id="err-${pos.id}"></div>
+    `;
+  }
+
+  function upsertCard(id, inner) {
+    let card = document.getElementById("card-" + id);
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "card";
+      card.id = "card-" + id;
+    }
+    card.innerHTML = inner;
+    return card;
+  }
+
+  async function refreshHealth() {
+    try {
+      const h = await api("/api/health");
+      if (h.strategies && h.strategies.length) strategies = h.strategies;
+      META.textContent = `${h.hostname} · ${h.bots_count} bot${h.bots_count === 1 ? "" : "s"} · up ${fmtDur(h.uptime_seconds)}`;
+    } catch {
+      META.textContent = "disconnected";
+    }
+  }
+
+  async function refreshAll() {
+    let bots = [];
+    try { bots = await api("/api/bots"); } catch { /* leave empty */ }
+    const botsSet = new Set(bots);
+
+    const wallet = (WALLET_INPUT.value || "").trim();
+    let positions = [];
+    let walletValid = isValidWallet(wallet);
+    let walletError = null;
+    if (walletValid) {
+      try {
+        const r = await api("/api/positions?wallet=" + encodeURIComponent(wallet));
+        positions = r.positions || [];
+      } catch (e) {
+        walletError = e.message || String(e);
+        console.error("positions", e);
+      }
+    }
+
+    const posIds = new Set(positions.map(p => p.id));
+    const orphanBots = bots.filter(b => !posIds.has(b)); // running but not in wallet
+
+    // If there's literally nothing to show, render the empty state.
+    if (!bots.length && !walletValid) {
+      MAIN.innerHTML = `
+        <div class="empty">
+          <p>No bots running, and no wallet address entered.</p>
+          <p>Paste a wallet address above and I'll list your WETH/USDC positions on Base.</p>
+        </div>`;
+      return;
+    }
+    if (!bots.length && walletValid && !positions.length) {
+      if (walletError) {
+        MAIN.innerHTML = `
+          <div class="empty">
+            <p style="color: var(--bad);">Failed to load positions: ${esc(walletError)}</p>
+            <p style="font-size:0.8rem;color:var(--muted);">Base's public RPC is rate-limited. If this persists across retries, try again in a minute.</p>
+          </div>`;
+      } else {
+        MAIN.innerHTML = `
+          <div class="empty">
+            <p>No WETH/USDC positions found for that wallet on Base.</p>
+            <p style="font-family: 'SF Mono', monospace; font-size: 0.8rem;">${esc(wallet)}</p>
+          </div>`;
+      }
+      return;
+    }
+
+    // Build layout: positions section (if any) + orphan bots section (if any).
+    if (!MAIN.querySelector("#positions-section") || !MAIN.querySelector("#bots-section")) {
+      MAIN.innerHTML = `
+        <div id="positions-section" style="display:none">
+          <div class="section-label">Your positions</div>
+          <div class="grid" id="positions-grid"></div>
+          <details class="empty-box" id="empty-details" style="display:none">
+            <summary id="empty-summary"></summary>
+            <div class="grid" id="empty-grid" style="margin-top:0.8rem"></div>
+          </details>
+        </div>
+        <div id="bots-section" style="display:none;margin-top:2rem">
+          <div class="section-label">Running bots</div>
+          <div class="grid" id="bots-grid"></div>
+        </div>`;
+    }
+
+    const posSection = MAIN.querySelector("#positions-section");
+    const botsSection = MAIN.querySelector("#bots-section");
+    const posGrid = MAIN.querySelector("#positions-grid");
+    const emptyDetails = MAIN.querySelector("#empty-details");
+    const emptySummary = MAIN.querySelector("#empty-summary");
+    const emptyGrid = MAIN.querySelector("#empty-grid");
+    const botsGrid = MAIN.querySelector("#bots-grid");
+
+    // --- Positions section: split into active (has liquidity OR running) vs empty ---
+    if (positions.length) {
+      posSection.style.display = "";
+
+      const active = positions.filter(p => p.has_liquidity || botsSet.has(p.id));
+      const empty = positions.filter(p => !p.has_liquidity && !botsSet.has(p.id));
+
+      async function renderTo(list, grid) {
+        const known = new Set();
+        for (const p of list) {
+          known.add(p.id);
+          let inner;
+          if (botsSet.has(p.id)) {
+            try {
+              const payload = await api("/api/state/" + encodeURIComponent(p.id));
+              inner = runningCard(p.id, payload);
+            } catch {
+              inner = runningCard(p.id, { position_id: p.id, state: null, log_tail: [], stale: true });
+            }
+          } else {
+            inner = positionCard(p, false);
+          }
+          const card = upsertCard(p.id, inner);
+          if (!card.parentNode || card.parentNode !== grid) grid.appendChild(card);
+        }
+        [...grid.children].forEach(c => {
+          if (!known.has(c.id.replace("card-", ""))) c.remove();
+        });
+      }
+
+      await renderTo(active, posGrid);
+      await renderTo(empty, emptyGrid);
+
+      if (empty.length) {
+        emptyDetails.style.display = "";
+        emptySummary.textContent = `${empty.length} empty position${empty.length === 1 ? "" : "s"} (no liquidity)`;
+      } else {
+        emptyDetails.style.display = "none";
+      }
+    } else {
+      posSection.style.display = "none";
+      posGrid.innerHTML = "";
+      emptyGrid.innerHTML = "";
+      emptyDetails.style.display = "none";
+    }
+
+    // --- Orphan bots section (running but not in this wallet) ---
+    if (orphanBots.length) {
+      botsSection.style.display = "";
+      const keep = new Set(orphanBots);
+      for (const id of orphanBots) {
+        try {
+          const payload = await api("/api/state/" + encodeURIComponent(id));
+          const card = upsertCard(id, runningCard(id, payload));
+          if (!card.parentNode || card.parentNode !== botsGrid) botsGrid.appendChild(card);
+        } catch { /* ignore individual failure */ }
+      }
+      [...botsGrid.children].forEach(c => {
+        if (!keep.has(c.id.replace("card-", ""))) c.remove();
+      });
+    } else {
+      botsSection.style.display = "none";
+      botsGrid.innerHTML = "";
+    }
+  }
+
+  // --- Console modal ---
+  function openConsole(id) {
+    openConsoleId = id;
+    MODAL_TITLE.textContent = "console · bot #" + id;
+    MODAL_LOG.textContent = "loading…";
+    MODAL.classList.add("open");
+    MODAL_BACKDROP.classList.add("open");
+    pollConsole();
+    if (consoleTimer) clearInterval(consoleTimer);
+    consoleTimer = setInterval(pollConsole, 2000);
+  }
+
+  function closeConsole() {
+    openConsoleId = null;
+    MODAL.classList.remove("open");
+    MODAL_BACKDROP.classList.remove("open");
+    if (consoleTimer) { clearInterval(consoleTimer); consoleTimer = null; }
+  }
+
+  async function pollConsole() {
+    if (!openConsoleId) return;
+    try {
+      const shouldFollow = FOLLOW.checked;
+      const wasNearBottom = isNearBottom(MODAL_LOG);
+      const previousScrollTop = MODAL_LOG.scrollTop;
+      const payload = await api("/api/state/" + encodeURIComponent(openConsoleId));
+      MODAL_LOG.innerHTML = renderLog(payload.log_tail);
+      if (shouldFollow && wasNearBottom) {
+        MODAL_LOG.scrollTop = MODAL_LOG.scrollHeight;
+      } else {
+        MODAL_LOG.scrollTop = previousScrollTop;
+      }
+      const logAge = payload.log_last_modified
+        ? (Date.now() / 1000) - payload.log_last_modified
+        : null;
+      const errors = (payload.log_tail || []).filter(l => /\[ERROR\]|FATAL/.test(l)).length;
+      MODAL_META.textContent = `${(payload.log_tail || []).length} lines · last write ${fmtAgo(logAge)}${payload.stale ? " · STALE" : ""}${errors ? ` · ${errors} error(s)` : ""}`;
+    } catch (e) {
+      MODAL_META.textContent = "fetch failed: " + e.message;
+    }
+  }
+
+  MODAL_LOG.addEventListener("scroll", () => {
+    FOLLOW.checked = isNearBottom(MODAL_LOG);
+  });
+
+  // --- Click delegation (cards + modal close) ---
+  MAIN.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button[data-action]");
+    if (!btn) return;
+    const id = btn.dataset.id;
+    const action = btn.dataset.action;
+    const errEl = document.getElementById("err-" + id);
+    if (errEl) errEl.textContent = "";
+
+    if (action === "console") {
+      openConsole(id);
+      return;
+    }
+    if (action === "start") {
+      const select = document.querySelector(`select[data-strategy="${id}"]`);
+      const strategy = select ? select.value : "exit_pool";
+      btn.disabled = true;
+      btn.textContent = "starting…";
+      try {
+        await api(`/api/bots/${encodeURIComponent(id)}/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ strategy }),
+        });
+        await refreshAll();
+      } catch (e) {
+        if (errEl) errEl.textContent = e.message || "start failed";
+        btn.disabled = false;
+        btn.textContent = "start as bot";
+      }
+      return;
+    }
+    if (action === "stop") {
+      if (!confirm("Stop bot " + id + "?")) return;
+      btn.disabled = true;
+      btn.textContent = "stopping…";
+      try {
+        await api(`/api/bots/${encodeURIComponent(id)}/stop`, { method: "POST" });
+        await refreshAll();
+      } catch (e) {
+        if (errEl) errEl.textContent = e.message || "stop failed";
+        btn.disabled = false;
+        btn.textContent = "stop";
+      }
+      return;
+    }
+    if (action === "ack-error") {
+      btn.disabled = true;
+      btn.textContent = "saving…";
+      try {
+        await api(`/api/bots/${encodeURIComponent(id)}/ack-error`, { method: "POST" });
+        await refreshAll();
+      } catch (e) {
+        if (errEl) errEl.textContent = e.message || "ack failed";
+        btn.disabled = false;
+        btn.textContent = "seen";
+      }
+      return;
+    }
+  });
+
+  MODAL_CLOSE.addEventListener("click", closeConsole);
+  // Note: Escape + backdrop-click close handlers are installed later
+  // (they need to dispatch to either console or strategies modal).
+
+  // --- Wallet input wiring ---
+  let walletDebounce = null;
+  WALLET_INPUT.addEventListener("input", () => {
+    clearTimeout(walletDebounce);
+    walletDebounce = setTimeout(() => {
+      const v = (WALLET_INPUT.value || "").trim();
+      if (v && !isValidWallet(v)) return;
+      localStorage.setItem("lp.wallet", v);
+      refreshAll();
+    }, 400);
+  });
+  WALLET_CLEAR.addEventListener("click", () => {
+    WALLET_INPUT.value = "";
+    localStorage.removeItem("lp.wallet");
+    refreshAll();
+  });
+
+  // --- Strategies modal ---
+  const STRATEGIES_MODAL = document.getElementById("strategies-modal");
+  const OPEN_STRATEGIES = document.getElementById("open-strategies");
+  const STRAT_LIST = document.getElementById("strat-list");
+  const STRAT_BODY = document.getElementById("strat-body");
+  const STRAT_HINT = document.getElementById("strat-hint");
+  const STRAT_CLOSE = document.getElementById("strat-close");
+  const STRAT_UPLOAD_INPUT = document.getElementById("strat-upload");
+  const STRAT_UPLOAD_BTN = document.getElementById("strat-upload-btn");
+
+  // Descriptions shown inline in the beautified view. Keyed by dotted path.
+  // Unknown fields render raw without a description — no crash if the JSON
+  // has custom keys we haven't documented.
+  const FIELD_DOCS = {
+    "name": "Human-readable label for this strategy",
+    "version": "Semver-ish version of this parameter set",
+    "description": "Free-form description of what this strategy does",
+    "strategy_type": "Which strategy logic the daemon runs (exit_pool, trend_following, fixed_range, …)",
+    "parameters.base_width_pct": "Width of the rebalance range, as % of price (e.g. 15 = ±7.5% around price)",
+    "parameters.trend_shift": "How much to shift the range toward the trend direction (0–1)",
+    "parameters.buffer_pct": "Buffer % past the range edges before triggering a rebalance (reduces churn)",
+    "parameters.exit_trend_pct": "Trend % threshold at which to exit the pool (only for strategy_type=exit_pool)",
+    "parameters.enter_trend_pct": "Trend % threshold below which it's safe to re-enter after an exit",
+    "parameters.rsi_exit_high": "Exit if RSI exceeds this (overbought)",
+    "parameters.rsi_exit_low": "Exit if RSI falls below this (oversold)",
+    "parameters.min_range_pct": "Minimum allowed range width (% of price)",
+    "parameters.max_range_pct": "Maximum allowed range width (% of price)",
+    "backtest_results.net_apr": "Backtested APR after fees and impermanent loss (%)",
+    "backtest_results.fee_apr": "Backtested fee APR only, before IL (%)",
+    "backtest_results.total_fees_usd": "Fees collected in the backtest period (USD)",
+    "backtest_results.total_il_usd": "Impermanent loss in the backtest period (USD)",
+    "backtest_results.rebalance_count": "How many rebalances the strategy would have performed",
+    "backtest_results.in_range_pct": "Fraction of time the position stayed in range (%)",
+    "data_sources.price_api": "Which service provides the price feed",
+    "data_sources.price_pair": "Identifier at the price source (e.g. ethereum/usd)",
+    "data_sources.poll_interval_seconds": "How often the daemon polls price (seconds)",
+    "data_sources.position_poll_interval_seconds": "How often the daemon reads the on-chain position (seconds)",
+    "data_sources.indicators.ema_fast": "Fast EMA period (default 20)",
+    "data_sources.indicators.ema_slow": "Slow EMA period (default 50)",
+    "data_sources.indicators.atr_period": "ATR period — volatility measure (default 14)",
+    "data_sources.indicators.rsi_period": "RSI period — reversal detection (default 14)",
+  };
+
+  let currentStrategy = null; // { name, source, content }
+  let isEditing = false;
+
+  function openStrategies() {
+    STRATEGIES_MODAL.classList.add("open");
+    MODAL_BACKDROP.classList.add("open");
+    refreshStrategies();
+  }
+  function closeStrategies() {
+    STRATEGIES_MODAL.classList.remove("open");
+    MODAL_BACKDROP.classList.remove("open");
+    currentStrategy = null;
+    isEditing = false;
+    STRAT_BODY.innerHTML = '<div class="upload-hint" id="strat-hint">Select a strategy on the left, or upload a new JSON file.</div>';
+  }
+
+  async function refreshStrategies(selectName = null) {
+    try {
+      const list = await api("/api/strategies");
+      STRAT_LIST.innerHTML = "";
+      for (const s of list) {
+        const el = document.createElement("div");
+        el.className = "item" + (selectName === s.name ? " active" : "");
+        el.dataset.name = s.name;
+        el.innerHTML = `
+          <span class="name">${esc(s.name)}</span>
+          <span class="src ${s.source}">${s.source}</span>
+        `;
+        el.addEventListener("click", () => showStrategy(s.name));
+        STRAT_LIST.appendChild(el);
+      }
+      if (selectName) showStrategy(selectName);
+    } catch (e) {
+      STRAT_LIST.innerHTML = `<div class="upload-hint">Failed to load: ${esc(e.message)}</div>`;
+    }
+  }
+
+  async function showStrategy(name) {
+    // Mark active
+    [...STRAT_LIST.children].forEach(c =>
+      c.classList.toggle("active", c.dataset.name === name));
+    try {
+      currentStrategy = await api("/api/strategies/" + encodeURIComponent(name));
+      isEditing = false;
+      renderStrategyBody();
+    } catch (e) {
+      STRAT_BODY.innerHTML = `<div class="upload-hint" style="color:var(--bad)">Failed: ${esc(e.message)}</div>`;
+    }
+  }
+
+  function renderStrategyBody() {
+    if (!currentStrategy) return;
+    const { name, source, content } = currentStrategy;
+    const editable = source === "user";
+    const jsonStr = JSON.stringify(content, null, 2);
+    STRAT_BODY.innerHTML = `
+      <div class="strategy-head">
+        <h3>${esc(name)} <span class="src ${source}" style="font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:3px;margin-left:0.5rem;text-transform:uppercase;letter-spacing:0.05em;${source==='user'?'background:var(--accent);color:var(--bg)':'color:var(--muted);border:1px solid var(--border)'}">${source}</span></h3>
+        <div class="actions">
+          ${editable ? (isEditing
+            ? '<button id="strat-save" class="primary">save</button><button id="strat-cancel">cancel</button>'
+            : '<button id="strat-edit">edit</button>')
+            : '<span style="color:var(--muted);font-size:0.8rem">built-in · read-only</span>'}
+        </div>
+      </div>
+      <div class="strategy-content" id="strat-content"></div>
+    `;
+    const contentBox = document.getElementById("strat-content");
+    if (isEditing) {
+      const ta = document.createElement("textarea");
+      ta.id = "strat-textarea";
+      ta.value = jsonStr;
+      contentBox.appendChild(ta);
+      document.getElementById("strat-save").addEventListener("click", saveEdits);
+      document.getElementById("strat-cancel").addEventListener("click", () => { isEditing = false; renderStrategyBody(); });
+    } else {
+      contentBox.appendChild(beautify(content, ""));
+      const editBtn = document.getElementById("strat-edit");
+      if (editBtn) editBtn.addEventListener("click", () => { isEditing = true; renderStrategyBody(); });
+    }
+  }
+
+  // Beautifier: walks the object, renders leaves with their dotted path's doc
+  // text if we have one. Nested objects become sub-sections.
+  function beautify(obj, prefix) {
+    const root = document.createElement("div");
+    root.className = "beautify";
+    for (const [k, v] of Object.entries(obj)) {
+      const fullKey = prefix ? `${prefix}.${k}` : k;
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        const group = document.createElement("div");
+        group.className = "group";
+        const title = document.createElement("div");
+        title.className = "group-title";
+        title.textContent = k;
+        group.appendChild(title);
+        group.appendChild(beautify(v, fullKey));
+        root.appendChild(group);
+      } else {
+        const row = document.createElement("div");
+        row.className = "row";
+        const keyEl = document.createElement("div");
+        keyEl.className = "key";
+        keyEl.textContent = k;
+        const doc = FIELD_DOCS[fullKey];
+        if (doc) {
+          const docEl = document.createElement("div");
+          docEl.className = "doc";
+          docEl.textContent = doc;
+          keyEl.appendChild(docEl);
+        }
+        const valEl = document.createElement("div");
+        valEl.className = "val " + (typeof v);
+        if (typeof v === "string") valEl.textContent = `"${v}"`;
+        else if (Array.isArray(v)) valEl.textContent = JSON.stringify(v);
+        else valEl.textContent = String(v);
+        row.appendChild(keyEl);
+        row.appendChild(valEl);
+        root.appendChild(row);
+      }
+    }
+    return root;
+  }
+
+  async function saveEdits() {
+    const ta = document.getElementById("strat-textarea");
+    if (!ta) return;
+    let parsed;
+    try { parsed = JSON.parse(ta.value); }
+    catch (e) { alert("JSON is invalid: " + e.message); return; }
+    try {
+      await api("/api/strategies/" + encodeURIComponent(currentStrategy.name), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(parsed),
+      });
+      isEditing = false;
+      currentStrategy.content = parsed;
+      renderStrategyBody();
+      refreshHealth(); // refresh the in-app strategy list cache
+    } catch (e) {
+      alert("Save failed: " + e.message);
+    }
+  }
+
+  // Upload: prompt for filename (default = original), then POST.
+  STRAT_UPLOAD_BTN.addEventListener("click", () => STRAT_UPLOAD_INPUT.click());
+  STRAT_UPLOAD_INPUT.addEventListener("change", async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    const text = await file.text();
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch (e) { alert("Not valid JSON: " + e.message); return; }
+    const suggestedName = file.name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 40);
+    const name = prompt("Save as (letters, digits, _ or -; 1–40 chars):", suggestedName);
+    if (!name) return;
+    if (!/^[a-zA-Z0-9_\-]{1,40}$/.test(name)) {
+      alert("Invalid name.");
+      return;
+    }
+    try {
+      await api("/api/strategies/" + encodeURIComponent(name), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(parsed),
+      });
+      ev.target.value = "";
+      await refreshStrategies(name);
+      refreshHealth();
+    } catch (e) {
+      alert("Upload failed: " + e.message);
+    }
+  });
+
+  OPEN_STRATEGIES.addEventListener("click", openStrategies);
+  STRAT_CLOSE.addEventListener("click", closeStrategies);
+
+  // --- Updates modal ---
+  const UPDATES_MODAL = document.getElementById("updates-modal");
+  const OPEN_UPDATES = document.getElementById("open-updates");
+  const UPDATES_BODY = document.getElementById("updates-body");
+  const UPDATES_CLOSE = document.getElementById("updates-close");
+
+  let postInstallBots = [];  // populated after an install succeeds
+
+  function openUpdates() {
+    UPDATES_MODAL.classList.add("open");
+    MODAL_BACKDROP.classList.add("open");
+    loadUpdateStatus();
+  }
+  function closeUpdates() {
+    UPDATES_MODAL.classList.remove("open");
+    MODAL_BACKDROP.classList.remove("open");
+  }
+
+  function renderCurrent(s, extra = "") {
+    const lc = s.last_commit || {};
+    const commitMsg = lc.message ? esc(lc.message) : "(unknown)";
+    const author = lc.author ? esc(lc.author) : "";
+    const date = lc.date ? new Date(lc.date).toLocaleString() : "";
+    const dirtyNote = s.has_local_changes
+      ? `<div style="color:var(--warn);margin-top:0.5rem;font-size:0.85rem">⚠ ${s.local_changes.length} locally-modified file${s.local_changes.length === 1 ? "" : "s"} — a future \`git pull\` may be blocked</div>`
+      : "";
+    return `
+      <div class="card" style="margin:0 0 1rem 0">
+        <div class="hdr"><span><span class="emoji">📦</span><span class="pid">current</span></span></div>
+        <dl>
+          <dt>Branch</dt><dd>${esc(s.branch || "?")} (tracks ${esc(s.upstream || "?")})</dd>
+          <dt>SHA</dt><dd>${esc(s.short || "?")}</dd>
+          <dt>Message</dt><dd>${commitMsg}</dd>
+          <dt>Author</dt><dd>${author}</dd>
+          <dt>Date</dt><dd>${esc(date)}</dd>
+          <dt>Behind by</dt><dd>${s.behind_by} commit${s.behind_by === 1 ? "" : "s"}</dd>
+        </dl>
+        ${dirtyNote}
+      </div>
+      ${extra}
+    `;
+  }
+
+  async function loadUpdateStatus() {
+    UPDATES_BODY.innerHTML = '<div class="upload-hint">loading…</div>';
+    try {
+      const s = await api("/api/update/status");
+      UPDATES_BODY.innerHTML = renderCurrent(s, `
+        <div class="card" style="margin:0">
+          <div class="actions">
+            <button class="primary" id="upd-check">check for updates</button>
+            <span id="upd-check-meta" style="color:var(--muted);font-size:0.85rem"></span>
+          </div>
+        </div>
+      `);
+      document.getElementById("upd-check").addEventListener("click", doCheck);
+    } catch (e) {
+      UPDATES_BODY.innerHTML = `<div class="upload-hint" style="color:var(--bad)">Failed: ${esc(e.message)}</div>`;
+    }
+  }
+
+  async function doCheck() {
+    const btn = document.getElementById("upd-check");
+    const meta = document.getElementById("upd-check-meta");
+    btn.disabled = true; btn.textContent = "fetching…"; if (meta) meta.textContent = "";
+    try {
+      const r = await api("/api/update/check", { method: "POST" });
+      let result;
+      if (r.behind_by === 0) {
+        result = `
+          <div class="card" style="margin:1rem 0 0 0">
+            <div class="hdr"><span><span class="emoji">✅</span><span class="pid">up to date</span></span></div>
+            <p style="color:var(--muted);font-size:0.9rem;margin:0.5rem 0 0 0">No new commits on ${esc(r.upstream)}.</p>
+          </div>`;
+      } else {
+        const rows = r.commits.map(c => `
+          <div class="row">
+            <div class="key">${esc(c.short)}</div>
+            <div class="val">
+              <div>${esc(c.message)}</div>
+              <div class="doc">${esc(c.author)} · ${esc(new Date(c.date).toLocaleString())}</div>
+            </div>
+          </div>`).join("");
+        result = `
+          <div class="card" style="margin:1rem 0 0 0">
+            <div class="hdr"><span><span class="emoji">🆕</span><span class="pid">${r.behind_by} commit${r.behind_by === 1 ? "" : "s"} behind</span></span></div>
+            <div class="beautify" style="margin-top:0.6rem">${rows}</div>
+            <div class="actions" style="margin-top:0.8rem">
+              <button class="primary" id="upd-install">install update</button>
+              ${r.has_local_changes ? '<span style="color:var(--warn);font-size:0.85rem">local changes may block pull</span>' : ''}
+            </div>
+          </div>
+          <div id="upd-install-result"></div>`;
+      }
+      // Re-render with new result block
+      UPDATES_BODY.innerHTML = renderCurrent(r);
+      UPDATES_BODY.insertAdjacentHTML("beforeend", `
+        <div class="card" style="margin:0">
+          <div class="actions">
+            <button class="primary" id="upd-check">check again</button>
+          </div>
+        </div>
+      ` + result);
+      document.getElementById("upd-check").addEventListener("click", doCheck);
+      const installBtn = document.getElementById("upd-install");
+      if (installBtn) installBtn.addEventListener("click", doInstall);
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "check for updates";
+      if (meta) meta.textContent = "failed: " + e.message;
+    }
+  }
+
+  async function doInstall() {
+    const btn = document.getElementById("upd-install");
+    btn.disabled = true; btn.textContent = "installing…";
+    try {
+      const s = await api("/api/update/install", { method: "POST" });
+      postInstallBots = s.affected_bots || [];
+      const restartRows = postInstallBots.map(id => `
+        <div class="row" id="restart-row-${esc(id)}">
+          <div class="key">#${esc(id)}</div>
+          <div class="val">
+            <button data-restart="${esc(id)}">restart</button>
+            <span class="doc" id="restart-msg-${esc(id)}"></span>
+          </div>
+        </div>`).join("");
+      const restartBlock = postInstallBots.length ? `
+        <div class="card" style="margin:1rem 0 0 0">
+          <div class="hdr"><span><span class="emoji">🔁</span><span class="pid">restart bots</span></span></div>
+          <p style="color:var(--muted);font-size:0.85rem;margin:0.3rem 0 0.7rem 0">
+            These bots are still running the old daemon code. Restart them to apply the update.
+          </p>
+          <div class="beautify">${restartRows}</div>
+        </div>` : `
+        <div class="card" style="margin:1rem 0 0 0">
+          <div class="hdr"><span><span class="emoji">✅</span><span class="pid">update installed</span></span></div>
+          <p style="color:var(--muted);font-size:0.85rem;margin:0.3rem 0 0 0">No bots were running — nothing to restart.</p>
+        </div>`;
+      UPDATES_BODY.innerHTML = renderCurrent(s) + `
+        <div class="card" style="margin:0 0 1rem 0">
+          <div class="hdr"><span><span class="emoji">✅</span><span class="pid">installed successfully</span></span></div>
+          <p style="color:var(--good);font-size:0.9rem;margin:0.3rem 0 0 0">
+            Now on <span style="font-family:monospace">${esc(s.short)}</span>. ${s.last_commit ? "Latest: " + esc(s.last_commit.message) : ""}
+          </p>
+        </div>
+      ` + restartBlock;
+      // Wire restart buttons
+      UPDATES_BODY.querySelectorAll("button[data-restart]").forEach(b => {
+        b.addEventListener("click", () => doRestart(b.dataset.restart));
+      });
+      // Also refresh the dashboard so running bots pick up the new SHA in meta.
+      refreshAll();
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = "install update";
+      const result = document.getElementById("upd-install-result");
+      if (result) result.innerHTML = `<div class="card" style="margin:0.8rem 0 0 0;border-color:var(--bad)"><p style="color:var(--bad);margin:0">Install failed: ${esc(e.message)}</p></div>`;
+    }
+  }
+
+  async function doRestart(id) {
+    const btn = document.querySelector(`button[data-restart="${CSS.escape(id)}"]`);
+    const msg = document.getElementById("restart-msg-" + id);
+    if (btn) { btn.disabled = true; btn.textContent = "restarting…"; }
+    if (msg) msg.textContent = "";
+    try {
+      await api("/api/bots/" + encodeURIComponent(id) + "/restart", { method: "POST" });
+      if (btn) { btn.textContent = "restarted"; btn.style.color = "var(--good)"; btn.style.borderColor = "var(--good)"; }
+      if (msg) msg.textContent = "ok";
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = "restart"; }
+      if (msg) { msg.textContent = "failed: " + e.message; msg.style.color = "var(--bad)"; }
+    }
+  }
+
+  OPEN_UPDATES.addEventListener("click", openUpdates);
+  UPDATES_CLOSE.addEventListener("click", closeUpdates);
+
+  // Single backdrop/Escape handler that dispatches to whichever modal is open.
+  MODAL_BACKDROP.addEventListener("click", () => {
+    if (STRATEGIES_MODAL.classList.contains("open")) closeStrategies();
+    if (UPDATES_MODAL.classList.contains("open")) closeUpdates();
+    if (MODAL.classList.contains("open")) closeConsole();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (STRATEGIES_MODAL.classList.contains("open")) closeStrategies();
+    if (UPDATES_MODAL.classList.contains("open")) closeUpdates();
+    if (MODAL.classList.contains("open")) closeConsole();
+  });
+
+  // --- Kickoff ---
+  refreshHealth();
+  refreshAll();
+  setInterval(refreshHealth, 10000);
+  setInterval(refreshAll, 5000);
+})();
+</script>
+</body>
+</html>
