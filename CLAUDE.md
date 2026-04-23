@@ -28,6 +28,7 @@
   - Web POST endpoints now perform a basic same-origin check (`Origin`/`Referer` vs `Host`) to reduce casual CSRF on authenticated sessions.
   - The web update flow now schedules a self-restart of `lp-web.service` after a successful install so dashboard code changes actually go live.
   - `lp-web.service` must not set `NoNewPrivileges=true`, because the dashboard intentionally relies on narrowly-scoped sudoers rules for bot control, bot restarts, and self-update flows.
+  - Strategy selection hardening in the Pi web UI (`2026-04-23`): the dashboard must persist the canonical strategy id for each bot (`exit_pool`, `optimal`, etc.) instead of inferring it from human-readable JSON fields like `name` or generic fields like `strategy_type`. Otherwise the selector can appear to revert to `exit_pool` after refresh even when the bot's `strategy.json` was updated.
   - Daemon startup hardening (`2026-04-23`): the Pi live bot should use the explicit `--shared-wallet-live` mode instead of relying on the old implicit `--dry-run` auto-promotion path.
   - Strategy consistency hardening (`2026-04-23`): the desktop app should route strategy decisions through `lp_core.evaluate_strategy` and only translate the result for UI presentation. Avoid re-implementing signal logic in GTK-only code.
   - Backtest search hardening (`2026-04-23`): walk-forward search should fail closed when too many candidate configs error, instead of silently selecting a winner from a badly degraded search window.

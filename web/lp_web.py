@@ -171,19 +171,53 @@ def clear_bot_logs(bot_id: str) -> tuple[bool, str]:
     return True, f"cleared: {', '.join(cleared)}"
 
 
+def _bot_strategy_name_file(bot_id: str) -> Path:
+    return BOTS_DIR / bot_id / "strategy_name"
+
+
+def _match_strategy_name(content: dict) -> str | None:
+    """Resolve a bot strategy JSON to one of the UI's canonical strategy names."""
+    if not isinstance(content, dict):
+        return None
+
+    known = {s["name"] for s in list_strategies()}
+    for key in ("selected_name", "name", "strategy_type"):
+        value = content.get(key)
+        if isinstance(value, str) and value in known:
+            return value
+
+    encoded = json.dumps(content, sort_keys=True, separators=(",", ":"))
+    for strategy in list_strategies():
+        resolved = read_strategy(strategy["name"])
+        if not resolved:
+            continue
+        candidate = resolved.get("content")
+        if not isinstance(candidate, dict):
+            continue
+        candidate_encoded = json.dumps(candidate, sort_keys=True, separators=(",", ":"))
+        if candidate_encoded == encoded:
+            return strategy["name"]
+
+    return None
+
+
 def bot_strategy_name(bot_id: str) -> str | None:
+    try:
+        saved = _bot_strategy_name_file(bot_id).read_text().strip()
+    except OSError:
+        saved = ""
+    if saved:
+        known = {s["name"] for s in list_strategies()}
+        if saved in known:
+            return saved
+
     strategy_file = BOTS_DIR / bot_id / "strategy.json"
     try:
         with strategy_file.open() as f:
             content = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    known = {s["name"] for s in list_strategies()}
-    for key in ("name", "strategy_type"):
-        value = content.get(key)
-        if isinstance(value, str) and value in known:
-            return value
-    return None
+    return _match_strategy_name(content)
 
 
 def diagnostics_text(bot_id: str) -> str:
@@ -592,7 +626,16 @@ def seed_bot_dir(bot_id: str, strategy: str) -> None:
     src = _strategy_path(strategy)
     if src is None:
         raise FileNotFoundError(f"strategy {strategy!r} not found in builtin or user dirs")
-    (bot_dir / "strategy.json").write_bytes(src.read_bytes())
+    try:
+        with src.open() as f:
+            content = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"invalid strategy source {src}: {e}") from e
+    if not isinstance(content, dict):
+        raise RuntimeError(f"invalid strategy source {src}: top-level JSON must be an object")
+    content["selected_name"] = strategy
+    (bot_dir / "strategy.json").write_text(json.dumps(content, indent=2))
+    _bot_strategy_name_file(bot_id).write_text(strategy)
 
 
 # --- Handler ---
