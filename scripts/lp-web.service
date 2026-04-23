@@ -1,0 +1,25 @@
+[Unit]
+Description=LP Ranger web dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lp-ranger
+Group=lp-ranger
+WorkingDirectory=/opt/lp-ranger/web
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/lp-ranger/venv/bin/python /opt/lp-ranger/web/lp_web.py
+Restart=on-failure
+RestartSec=10
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# The web dashboard intentionally uses narrowly-scoped sudoers rules for
+# bot control and update/restart actions, so NoNewPrivileges must stay off.
+ReadWritePaths=/var/lib/lp-ranger/bots /var/lib/lp-ranger/strategies /opt/lp-ranger /var/lib/lp-ranger/web
+MemoryMax=40M
+
+[Install]
+WantedBy=multi-user.target
