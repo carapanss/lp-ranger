@@ -72,8 +72,8 @@ def run_backtest(cfg, candles, *,
                  gas_usd_per_action=DEFAULT_GAS_USD,
                  fee_daily_base=DEFAULT_FEE_DAILY_BASE,
                  fee_width_ref=DEFAULT_FEE_WIDTH_REF,
-                 cooldown_hours=DEFAULT_COOLDOWN_H,
-                 max_actions_per_day=DEFAULT_MAX_ACTIONS_PER_DAY,
+                 cooldown_hours=None,
+                 max_actions_per_day=None,
                  hist_cap=400,
                  indicators=None) -> BacktestResult:
     """Replay the candle stream under `cfg`. Returns a BacktestResult.
@@ -112,6 +112,9 @@ def run_backtest(cfg, candles, *,
 
     p = cfg.get("parameters", {})
     strategy_type = cfg.get("strategy_type", "exit_pool")
+    execution = cfg.get("execution", {})
+    if not isinstance(execution, dict):
+        execution = {}
     base_width_pct = float(p.get("base_width_pct", p.get("width_pct", 15)))
     trend_shift = float(p.get("trend_shift", 0.4))
     buffer_pct = float(p.get("buffer_pct", 5))
@@ -126,6 +129,11 @@ def run_backtest(cfg, candles, *,
     eth_held = 0.0
     pool_active = False
     hold_asset = "USDC"
+
+    if cooldown_hours is None:
+        cooldown_hours = float(execution.get("cooldown_seconds", DEFAULT_COOLDOWN_H * 3600)) / 3600.0
+    if max_actions_per_day is None:
+        max_actions_per_day = int(execution.get("max_actions_per_day", DEFAULT_MAX_ACTIONS_PER_DAY))
 
     last_action_s = -10 * 86400
     actions_today = 0

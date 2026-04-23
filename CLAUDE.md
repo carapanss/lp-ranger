@@ -29,6 +29,8 @@
   - Daemon startup hardening (`2026-04-23`): the Pi live bot should use the explicit `--shared-wallet-live` mode instead of relying on the old implicit `--dry-run` auto-promotion path.
   - Strategy consistency hardening (`2026-04-23`): the desktop app should route strategy decisions through `lp_core.evaluate_strategy` and only translate the result for UI presentation. Avoid re-implementing signal logic in GTK-only code.
   - Backtest search hardening (`2026-04-23`): walk-forward search should fail closed when too many candidate configs error, instead of silently selecting a winner from a badly degraded search window.
+  - Desktop install path on the laptop is `~/.local/share/lp-ranger/app`. That installed copy can drift from the repo checkout if `install.sh` is not rerun or files are not manually synced.
+  - Practical mismatch seen on `2026-04-23`: laptop config was using `strategy_optimal.json` while the Pi bot for position `5009590` was using `Exit Pool Strategy v1`. When desktop and Pi disagree, verify both the strategy file and the installed app copy before blaming the bot.
 
 ## Overview
 Autonomous WETH/USDC liquidity pool manager for Uniswap V3 on Base chain. Detects signals, executes rebalances/exits/entries by signing on-chain transactions automatically.

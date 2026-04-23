@@ -356,6 +356,15 @@ class Strategy:
                  "pool_active": pool_active, "hold_asset": hold_asset}
         return lp_core.evaluate_strategy(self.cfg, price, state, price_history)
 
+    def execution_cfg(self):
+        ex = self.cfg.get("execution", {})
+        if not isinstance(ex, dict):
+            ex = {}
+        return {
+            "cooldown_seconds": int(ex.get("cooldown_seconds", COOLDOWN_SECONDS)),
+            "max_actions_per_day": int(ex.get("max_actions_per_day", MAX_ACTIONS_PER_DAY)),
+        }
+
 # ============================================================
 # CLAUDE CODE INTEGRATION
 # ============================================================
@@ -472,9 +481,19 @@ def execute_action(action, state, password=None, pk=None, dry_run=False):
 # MAIN DAEMON LOOP
 # ============================================================
 def daemon_loop(args):
+    global COOLDOWN_SECONDS, MAX_ACTIONS_PER_DAY
     state = State()
     strategy_path = args.strategy or str(APP_DIR / "strategy_exit_pool.json")
     strategy = Strategy(strategy_path)
+    execution_cfg = strategy.execution_cfg()
+    if args.cooldown is not None:
+        COOLDOWN_SECONDS = args.cooldown
+    else:
+        COOLDOWN_SECONDS = execution_cfg["cooldown_seconds"]
+    if args.max_actions_per_day is not None:
+        MAX_ACTIONS_PER_DAY = args.max_actions_per_day
+    else:
+        MAX_ACTIONS_PER_DAY = execution_cfg["max_actions_per_day"]
 
     # Start the LED blinker (Pi only; no-op elsewhere). Background thread.
     led_thread = None
@@ -782,7 +801,8 @@ if __name__ == "__main__":
     pa.add_argument("--password-file", help=f"File with AutoBot unlock password (default: {DEFAULT_PASSWORD_FILE})")
     pa.add_argument("--setup-vps", action="store_true", help="Show VPS setup instructions")
     pa.add_argument("--poll", type=int, default=300, help="Poll interval in seconds")
-    pa.add_argument("--cooldown", type=int, default=14400, help="Cooldown between actions in seconds")
+    pa.add_argument("--cooldown", type=int, help="Cooldown between actions in seconds")
+    pa.add_argument("--max-actions-per-day", type=int, help="Maximum automated actions per day")
     pa.add_argument("--no-autodiscover", action="store_true",
                     help="Disable wallet-scan position auto-discovery (pin to --position-id)")
     pa.add_argument("--no-led", action="store_true",
@@ -794,6 +814,4 @@ if __name__ == "__main__":
         sys.exit(0)
 
     POLL_SECONDS = args.poll
-    COOLDOWN_SECONDS = args.cooldown
-
     daemon_loop(args)
