@@ -541,6 +541,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text_download(self, filename: str, body: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0") or "0")
         if not length:
@@ -585,6 +594,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"ok": False, "error": "bot not found"})
                 return
             self._send_json(200, read_state(bot_id))
+            return
+
+        if path.startswith("/api/bots/") and path.endswith("/download-log"):
+            bot_id = unquote(path[len("/api/bots/"):-len("/download-log")])
+            if not bot_id.isdigit():
+                self._send_json(400, {"ok": False, "error": "invalid bot id"})
+                return
+            data_dir = BOTS_DIR / bot_id / ".local" / "share" / "lp-ranger"
+            log_file = data_dir / "daemon.log"
+            try:
+                body = log_file.read_bytes()
+            except FileNotFoundError:
+                body = b""
+            except OSError as e:
+                self._send_json(500, {"ok": False, "error": f"log read failed: {e}"})
+                return
+            self._send_text_download(f"lp-ranger-bot-{bot_id}.log", body)
             return
 
         if path == "/api/update/status":

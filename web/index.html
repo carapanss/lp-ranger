@@ -404,6 +404,7 @@
   <header>
     <h2 id="modal-title">console</h2>
     <div style="display:flex;gap:0.5rem;align-items:center">
+      <button class="close" id="modal-download">download log</button>
       <button class="close" id="modal-clear">clear log</button>
       <button class="close" id="modal-close">close</button>
     </div>
@@ -458,6 +459,7 @@
   const MODAL_LOG = document.getElementById("modal-log");
   const MODAL_META = document.getElementById("modal-meta");
   const MODAL_CLOSE = document.getElementById("modal-close");
+  const MODAL_DOWNLOAD = document.getElementById("modal-download");
   const MODAL_CLEAR = document.getElementById("modal-clear");
   const FOLLOW = document.getElementById("follow");
 
@@ -840,6 +842,11 @@
       MODAL_CLEAR.disabled = false;
       MODAL_CLEAR.textContent = "clear log";
     }
+  });
+
+  MODAL_DOWNLOAD.addEventListener("click", () => {
+    if (!openConsoleId) return;
+    window.open(`/api/bots/${encodeURIComponent(openConsoleId)}/download-log`, "_blank", "noopener");
   });
 
   // --- Click delegation (cards + modal close) ---

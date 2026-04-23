@@ -2,6 +2,7 @@
 
 ## Documentation discipline
 - `CLAUDE.md` is the canonical handoff file for this project. Any meaningful architectural, operational, deployment, or workflow change must be reflected here in the same change set.
+- Agent behavior preference: when a user request suggests adjacent improvements, proactively propose small, relevant follow-up features instead of waiting to be asked. Keep those suggestions concrete and scoped.
 - If a future chat/agent adds or modifies components outside this repo (for example a Raspberry Pi web UI, a helper service, a second repo, a cron/timer, or a systemd unit override), document:
   - where that code lives
   - how it is deployed
@@ -17,6 +18,9 @@
   - Recovery status: the web files were copied back into the laptop repo under `web/` on `2026-04-23` so they can be versioned from now on.
   - The Pi also does not have a clone at `~/lp-ranger`; the live install is under `/opt/lp-ranger`.
   - Operator constraint: interactions with the Pi must be driven from the laptop terminal over SSH; do not assume direct shell access on the Pi outside that path.
+  - Product constraint: keep the Pi web UI lightweight and operationally focused. It runs alongside the daemon on constrained hardware, so prefer low-RSS, stdlib-first features that help monitoring/control without competing with the bot for RAM.
+  - Resource intent: the Raspberry Pi deployment target is a Pi Zero 2 W class box (512 MB RAM). The bot must keep comfortable headroom. Avoid adding heavy web stacks, background workers, or browser-side complexity unless there is a strong operational reason.
+  - Feature split: the desktop app can own richer/manual controls because it runs on the laptop. The Pi web UI should focus on remote monitoring, log inspection, lightweight controls, updates, and diagnostics rather than duplicating every desktop action.
 
 ## Overview
 Autonomous WETH/USDC liquidity pool manager for Uniswap V3 on Base chain. Detects signals, executes rebalances/exits/entries by signing on-chain transactions automatically.
