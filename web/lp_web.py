@@ -530,6 +530,9 @@ def _strategy_path(name: str) -> Path | None:
     user = USER_STRATEGIES_DIR / f"{name}.json"
     if user.exists():
         return user
+    prefixed_user = USER_STRATEGIES_DIR / f"strategy_{name}.json"
+    if prefixed_user.exists():
+        return prefixed_user
     builtin = APP_DIR / f"strategy_{name}.json"
     if builtin.exists():
         return builtin
@@ -544,7 +547,7 @@ def list_strategies() -> list[dict]:
         seen[name] = {"name": name, "source": "builtin"}
     if USER_STRATEGIES_DIR.exists():
         for p in sorted(USER_STRATEGIES_DIR.glob("*.json")):
-            name = p.stem
+            name = p.stem.removeprefix("strategy_")
             if STRATEGY_NAME_RE.match(name):
                 seen[name] = {"name": name, "source": "user"}  # user overrides builtin
     return list(seen.values())
