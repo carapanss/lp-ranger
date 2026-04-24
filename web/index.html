@@ -602,18 +602,17 @@
     const lc = maxVal > CRIT_KB ? "#f85149" : maxVal > WARN_KB ? "#f0883e" : "#3fb950";
     const fc = maxVal > CRIT_KB ? "rgba(248,81,73,.12)" : maxVal > WARN_KB ? "rgba(240,136,62,.12)" : "rgba(63,185,80,.12)";
 
-    const refLines = [[TOTAL_KB,"var(--muted)",false],[CRIT_KB,"#f85149",true],[WARN_KB,"#f0883e",true],[0,"var(--muted)",false]]
-      .map(([v,clr,dashed]) => {
+    const refLines = [[TOTAL_KB,"var(--muted)",.15],[CRIT_KB,"#f85149",.4],[WARN_KB,"#f0883e",.4],[0,"var(--muted)",.15]]
+      .map(([v,clr,op]) => {
         const y = sy(v).toFixed(1);
-        const dash = dashed ? `stroke-dasharray="20 15"` : "";
-        return `<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="${clr}" stroke-width="${dashed?2:1}" ${dash} opacity="${dashed?.5:.2}"/>`;
+        return `<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="${clr}" stroke-width="1.5" opacity="${op}"/>`;
       }).join("");
 
     const maxIdx = vals.lastIndexOf(maxVal);
     const curX = sx(vals.length-1).toFixed(0), curY = sy(vals[vals.length-1]).toFixed(1);
     const mX = sx(maxIdx).toFixed(0), mY = sy(maxVal).toFixed(1);
     const mCircle = maxVal !== vals[vals.length-1]
-      ? `<circle cx="${mX}" cy="${mY}" r="7" fill="${lc}" opacity=".85"/>` : "";
+      ? `<circle cx="${mX}" cy="${mY}" r="5" fill="${lc}" opacity=".85"/>` : "";
 
     // HTML labels — % coords so they align with the stretched SVG lines
     const pct = (v, off=9) => ((sy(v) + off) / H * 100).toFixed(1);
@@ -630,8 +629,8 @@
         <rect width="${W}" height="${H}" fill="var(--bg)" rx="4"/>
         ${refLines}
         <polygon points="${area}" fill="${fc}"/>
-        <polyline points="${pts}" fill="none" stroke="${lc}" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
-        ${mCircle}<circle cx="${curX}" cy="${curY}" r="7" fill="${lc}"/>
+        <polyline points="${pts}" fill="none" stroke="${lc}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+        ${mCircle}<circle cx="${curX}" cy="${curY}" r="5" fill="${lc}"/>
       </svg>
       ${lsp(TOTAL_KB)}512M</span>
       ${lsp(CRIT_KB,9,"#f85149")}400M</span>
@@ -871,10 +870,18 @@
       <div class="actions">
         <select data-strategy="${id}">${stratOpts}</select>
         <button class="ghost" data-action="set-strategy" data-id="${id}">apply strategy</button>
-        <button class="ghost" data-action="set-capital" data-id="${id}" title="Capital máximo a depositar en la pool">capital</button>
+        <button class="ghost" data-action="set-capital" data-id="${id}" title="Capital máximo en la pool">capital</button>
         <button data-action="console" data-id="${id}">full log</button>
         ${ackButton}
         <button class="danger" data-action="stop" data-id="${id}">stop</button>
+      </div>
+      <div id="capital-form-${id}" style="display:none;gap:0.3rem;align-items:center;flex-wrap:wrap;margin-top:0.4rem" class="actions">
+        <input id="capital-input-${id}" type="number" min="1" step="1"
+          placeholder="USD límite (vacío = todo el saldo)"
+          value="${targetUsd ? Math.round(targetUsd) : ''}"
+          style="flex:1;min-width:130px;background:var(--bg);color:var(--fg);border:1px solid var(--accent);padding:0.3rem 0.6rem;border-radius:5px;font-family:inherit;font-size:0.8rem">
+        <button data-action="save-capital" data-id="${id}" class="primary">guardar</button>
+        <button data-action="cancel-capital" data-id="${id}" class="ghost">cancelar</button>
       </div>
       <div class="perf-note">Track: ${perf.trackedDays > 0 ? perf.trackedDays.toFixed(1) + " d" : "—"} · fees ${fmtMoney(payload.performance ? payload.performance.fees_usd : null)} · IL ${fmtMoney(payload.performance ? -Math.abs(payload.performance.il_usd || 0) : null)}</div>
       ${strategyPerf.length ? `
@@ -1303,9 +1310,9 @@
       return;
     }
     if (action === "deploy-capital") {
-      if (!confirm(`Rebalancear bot #${id} ahora con todo el capital disponible?\n(Ignora cooldown — ejecuta en el próximo ciclo, ~5 min)`)) return;
+      // No confirm() — execute directly; setBotMsg gives feedback
       btn.disabled = true;
-      btn.textContent = "…";
+      btn.textContent = "enviando…";
       try {
         await api(`/api/bots/${encodeURIComponent(id)}/deploy-capital`, { method: "POST" });
         setBotMsg(id, "✅ Deploy solicitado — el daemon ejecutará en el próximo ciclo (~5 min)", "var(--good)", 30000);
@@ -1318,21 +1325,23 @@
       return;
     }
     if (action === "set-capital") {
-      // Fetch current value to pre-fill the prompt
-      let current = null;
-      try {
-        const r = await api(`/api/bots/${encodeURIComponent(id)}/config`);
-        current = (r.config || {}).target_usd || null;
-      } catch { /* ignore */ }
-      const hint = current ? `Actual: $${Math.round(current)}` : "Actual: todo disponible";
-      const raw = prompt(
-        `Capital máximo a depositar en la pool (USD).\n${hint}\nDejar vacío = usar todo el saldo disponible.\nEjemplo: 500`,
-        current != null ? String(Math.round(current)) : ""
-      );
-      if (raw === null) return;  // cancelled
-      const val = raw.trim() === "" ? null : parseFloat(raw.trim());
+      // Toggle inline form — no prompt() which browsers block silently
+      const form = document.getElementById("capital-form-" + id);
+      if (!form) return;
+      const visible = form.style.display !== "none";
+      form.style.display = visible ? "none" : "flex";
+      if (!visible) {
+        const inp = document.getElementById("capital-input-" + id);
+        if (inp) { inp.focus(); inp.select(); }
+      }
+      return;
+    }
+    if (action === "save-capital") {
+      const inp = document.getElementById("capital-input-" + id);
+      const raw = inp ? inp.value.trim() : "";
+      const val = raw === "" ? null : parseFloat(raw);
       if (val !== null && (isNaN(val) || val <= 0)) {
-        alert("Introduce un número positivo o deja vacío para usar todo el saldo.");
+        setBotMsg(id, "❌ Introduce un número positivo o deja vacío para usar todo el saldo", "var(--bad)", 10000);
         return;
       }
       btn.disabled = true;
@@ -1343,14 +1352,21 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ target_usd: val }),
         });
+        const form = document.getElementById("capital-form-" + id);
+        if (form) form.style.display = "none";
         setBotMsg(id, val ? `✅ Capital limitado a $${Math.round(val)}` : "✅ Capital: todo disponible", "var(--good)");
         await refreshAll();
       } catch (e) {
-        setBotMsg(id, "❌ " + (e.message || "error al guardar capital"), "var(--bad)", 15000);
+        setBotMsg(id, "❌ " + (e.message || "error al guardar"), "var(--bad)", 15000);
       } finally {
         btn.disabled = false;
-        btn.textContent = "capital";
+        btn.textContent = "guardar";
       }
+      return;
+    }
+    if (action === "cancel-capital") {
+      const form = document.getElementById("capital-form-" + id);
+      if (form) form.style.display = "none";
       return;
     }
   });
