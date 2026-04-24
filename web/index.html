@@ -479,6 +479,29 @@
   </div>
 </div>
 
+<!-- Capital modal -->
+<div class="modal" id="capital-modal">
+  <header>
+    <h2 id="capital-modal-title">pool capital</h2>
+    <button class="close" id="capital-close">close</button>
+  </header>
+  <div class="strategy-content" style="padding:1rem;overflow:auto">
+    <div class="card" style="margin:0">
+      <p style="margin:0 0 0.8rem 0;color:var(--muted);font-size:0.9rem">
+        Límite máximo de USD que el bot debe mantener dentro de la pool. Déjalo vacío para usar todo el capital disponible.
+      </p>
+      <div class="actions" style="margin-top:0">
+        <input id="capital-modal-input" type="number" min="1" step="1"
+          placeholder="vacío = all available"
+          style="flex:1;min-width:180px;background:var(--bg);color:var(--fg);border:1px solid var(--accent);padding:0.45rem 0.7rem;border-radius:5px;font-family:inherit;font-size:0.9rem">
+        <button class="primary" id="capital-save">save</button>
+        <button class="ghost" id="capital-clear">all available</button>
+      </div>
+      <div class="err" id="capital-modal-msg" style="margin-top:0.8rem"></div>
+    </div>
+  </div>
+</div>
+
 <script>
 (() => {
   const STATUS_EMOJI_RE = /[🟢🟡🔴🚪🔄📦⚪]/g;
@@ -497,10 +520,18 @@
   const MODAL_DOWNLOAD = document.getElementById("modal-download");
   const MODAL_CLEAR = document.getElementById("modal-clear");
   const FOLLOW = document.getElementById("follow");
+  const CAPITAL_MODAL = document.getElementById("capital-modal");
+  const CAPITAL_MODAL_TITLE = document.getElementById("capital-modal-title");
+  const CAPITAL_MODAL_INPUT = document.getElementById("capital-modal-input");
+  const CAPITAL_MODAL_MSG = document.getElementById("capital-modal-msg");
+  const CAPITAL_CLOSE = document.getElementById("capital-close");
+  const CAPITAL_SAVE = document.getElementById("capital-save");
+  const CAPITAL_CLEAR = document.getElementById("capital-clear");
 
   let strategies = ["exit_pool", "v1", "aggressive"];
   let openConsoleId = null;
   let consoleTimer = null;
+  let openCapitalId = null;
   const LOG_FOLLOW_THRESHOLD = 24;
 
   // Persistent per-bot messages that survive card re-renders (cleared after TTL).
@@ -518,6 +549,52 @@
   }
   function applyAllBotMsgs() {
     for (const id of [..._botMsg.keys()]) _applyBotMsg(id);
+  }
+
+  function openCapitalModal(id, currentTargetUsd) {
+    openCapitalId = String(id);
+    CAPITAL_MODAL_TITLE.textContent = `pool capital · bot #${id}`;
+    CAPITAL_MODAL_INPUT.value = currentTargetUsd ? String(Math.round(currentTargetUsd)) : "";
+    CAPITAL_MODAL_MSG.textContent = "";
+    CAPITAL_MODAL_MSG.style.color = "";
+    CAPITAL_MODAL.classList.add("open");
+    MODAL_BACKDROP.classList.add("open");
+    setTimeout(() => {
+      CAPITAL_MODAL_INPUT.focus();
+      CAPITAL_MODAL_INPUT.select();
+    }, 0);
+  }
+
+  function closeCapitalModal() {
+    openCapitalId = null;
+    CAPITAL_MODAL.classList.remove("open");
+    MODAL_BACKDROP.classList.remove("open");
+  }
+
+  async function saveCapitalModal(value) {
+    if (!openCapitalId) return;
+    CAPITAL_SAVE.disabled = true;
+    CAPITAL_CLEAR.disabled = true;
+    CAPITAL_CLOSE.disabled = true;
+    CAPITAL_SAVE.textContent = "saving…";
+    try {
+      await api(`/api/bots/${encodeURIComponent(openCapitalId)}/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target_usd: value }),
+      });
+      setBotMsg(openCapitalId, value ? `✅ Capital limitado a $${Math.round(value)}` : "✅ Capital: todo disponible", "var(--good)");
+      closeCapitalModal();
+      await refreshAll();
+    } catch (e) {
+      CAPITAL_MODAL_MSG.style.color = "var(--bad)";
+      CAPITAL_MODAL_MSG.textContent = e.message || "save failed";
+    } finally {
+      CAPITAL_SAVE.disabled = false;
+      CAPITAL_CLEAR.disabled = false;
+      CAPITAL_CLOSE.disabled = false;
+      CAPITAL_SAVE.textContent = "save";
+    }
   }
 
   // --- Persistence ---
@@ -583,60 +660,48 @@
     return (kb / 1024).toFixed(0) + " MB";
   }
 
-  // RAM chart — preserveAspectRatio="none" fills 100% width; HTML <span>
-  // labels are absolutely-positioned so they never stretch with the SVG.
-  // SVG coordinate space: 1000×100 (shapes scale, labels don't).
+  // Simple full-width RAM chart with subtle reference bands.
   function ramChartSvg(history) {
     if (!history || history.length < 2) return "";
     const vals = history.map(h => h.kb);
     const TOTAL_KB = 512 * 1024, WARN_KB = 200 * 1024, CRIT_KB = 400 * 1024;
     const maxVal = Math.max(...vals);
-    const W = 1000, H = 100, padT = 8, padB = 18, iH = H - padT - padB;
+    const W = 1000, H = 76, pad = 6, iH = H - pad * 2;
 
-    const sy = v => padT + iH * (1 - v / TOTAL_KB);
+    const sy = v => pad + iH * (1 - v / TOTAL_KB);
     const sx = i => (i / Math.max(vals.length - 1, 1)) * W;
 
     const pts  = vals.map((v, i) => `${sx(i).toFixed(0)},${sy(v).toFixed(1)}`).join(" ");
-    const area = `0,${(padT + iH).toFixed(1)} ${pts} ${W},${(padT + iH).toFixed(1)}`;
+    const area = `0,${(pad + iH).toFixed(1)} ${pts} ${W},${(pad + iH).toFixed(1)}`;
 
     const lc = maxVal > CRIT_KB ? "#f85149" : maxVal > WARN_KB ? "#f0883e" : "#3fb950";
     const fc = maxVal > CRIT_KB ? "rgba(248,81,73,.12)" : maxVal > WARN_KB ? "rgba(240,136,62,.12)" : "rgba(63,185,80,.12)";
 
-    const refLines = [[TOTAL_KB,"var(--muted)",.15],[CRIT_KB,"#f85149",.4],[WARN_KB,"#f0883e",.4],[0,"var(--muted)",.15]]
-      .map(([v,clr,op]) => {
-        const y = sy(v).toFixed(1);
-        return `<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="${clr}" stroke-width="1.5" opacity="${op}"/>`;
-      }).join("");
+    const bands = `
+      <rect x="0" y="${sy(CRIT_KB).toFixed(1)}" width="${W}" height="${(sy(WARN_KB) - sy(CRIT_KB)).toFixed(1)}" fill="rgba(240,136,62,.06)"/>
+      <rect x="0" y="${pad}" width="${W}" height="${(sy(CRIT_KB) - pad).toFixed(1)}" fill="rgba(248,81,73,.06)"/>
+    `;
+    const refs = [
+      [WARN_KB, "#f0883e", 0.35],
+      [CRIT_KB, "#f85149", 0.35],
+    ].map(([v, clr, op]) =>
+      `<line x1="0" y1="${sy(v).toFixed(1)}" x2="${W}" y2="${sy(v).toFixed(1)}" stroke="${clr}" stroke-width="1.2" opacity="${op}"/>`
+    ).join("");
 
     const maxIdx = vals.lastIndexOf(maxVal);
     const curX = sx(vals.length-1).toFixed(0), curY = sy(vals[vals.length-1]).toFixed(1);
     const mX = sx(maxIdx).toFixed(0), mY = sy(maxVal).toFixed(1);
     const mCircle = maxVal !== vals[vals.length-1]
       ? `<circle cx="${mX}" cy="${mY}" r="5" fill="${lc}" opacity=".85"/>` : "";
-
-    // HTML labels — % coords so they align with the stretched SVG lines
-    const pct = (v, off=9) => ((sy(v) + off) / H * 100).toFixed(1);
-    const mXpct = (sx(maxIdx) / W * 100).toFixed(1);
-    const mYpct = Math.max(1, sy(maxVal) / H * 100 - 13).toFixed(1);
-    const mSide = Number(mXpct) > 60 ? `right:${(100-Number(mXpct)).toFixed(1)}%` : `left:${mXpct}%`;
-    const mLbl  = maxVal !== vals[vals.length-1]
-      ? `<span style="position:absolute;top:${mYpct}%;${mSide};font-size:9px;color:${lc};white-space:nowrap;line-height:1">▲${fmtRam(maxVal)}</span>` : "";
-    const lsp = (v, off=9, clr="var(--muted)") =>
-      `<span style="position:absolute;top:${pct(v,off)}%;left:3px;font-size:9px;color:${clr};opacity:.7;line-height:1">`;
-
-    return `<div style="position:relative;width:100%;height:${H}px;margin:0.4rem 0 0">
+    return `<div style="position:relative;width:100%;height:${H}px;margin:0.35rem 0 0">
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;width:100%;height:100%">
         <rect width="${W}" height="${H}" fill="var(--bg)" rx="4"/>
-        ${refLines}
+        ${bands}
+        ${refs}
         <polygon points="${area}" fill="${fc}"/>
         <polyline points="${pts}" fill="none" stroke="${lc}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
         ${mCircle}<circle cx="${curX}" cy="${curY}" r="5" fill="${lc}"/>
       </svg>
-      ${lsp(TOTAL_KB)}512M</span>
-      ${lsp(CRIT_KB,9,"#f85149")}400M</span>
-      ${lsp(WARN_KB,9,"#f0883e")}200M</span>
-      ${lsp(0,-13)}0</span>
-      ${mLbl}
     </div>`;
   }
 
@@ -870,18 +935,10 @@
       <div class="actions">
         <select data-strategy="${id}">${stratOpts}</select>
         <button class="ghost" data-action="set-strategy" data-id="${id}">apply strategy</button>
-        <button class="ghost" data-action="set-capital" data-id="${id}" title="Capital máximo en la pool">capital</button>
+        <button class="ghost" data-action="set-capital" data-id="${id}" data-target-usd="${targetUsd ?? ""}" title="Capital máximo en la pool">capital</button>
         <button data-action="console" data-id="${id}">full log</button>
         ${ackButton}
         <button class="danger" data-action="stop" data-id="${id}">stop</button>
-      </div>
-      <div id="capital-form-${id}" style="display:none;gap:0.3rem;align-items:center;flex-wrap:wrap;margin-top:0.4rem" class="actions">
-        <input id="capital-input-${id}" type="number" min="1" step="1"
-          placeholder="USD límite (vacío = todo el saldo)"
-          value="${targetUsd ? Math.round(targetUsd) : ''}"
-          style="flex:1;min-width:130px;background:var(--bg);color:var(--fg);border:1px solid var(--accent);padding:0.3rem 0.6rem;border-radius:5px;font-family:inherit;font-size:0.8rem">
-        <button data-action="save-capital" data-id="${id}" class="primary">guardar</button>
-        <button data-action="cancel-capital" data-id="${id}" class="ghost">cancelar</button>
       </div>
       <div class="perf-note">Track: ${perf.trackedDays > 0 ? perf.trackedDays.toFixed(1) + " d" : "—"} · fees ${fmtMoney(payload.performance ? payload.performance.fees_usd : null)} · IL ${fmtMoney(payload.performance ? -Math.abs(payload.performance.il_usd || 0) : null)}</div>
       ${strategyPerf.length ? `
@@ -1315,7 +1372,8 @@
       btn.textContent = "enviando…";
       try {
         await api(`/api/bots/${encodeURIComponent(id)}/deploy-capital`, { method: "POST" });
-        setBotMsg(id, "✅ Deploy solicitado — el daemon ejecutará en el próximo ciclo (~5 min)", "var(--good)", 30000);
+        setBotMsg(id, "✅ Deploy solicitado — reiniciando bot para ejecutar ya", "var(--good)", 30000);
+        await refreshAll();
       } catch (e) {
         setBotMsg(id, "❌ " + (e.message || "error al solicitar deploy"), "var(--bad)", 15000);
       } finally {
@@ -1325,48 +1383,8 @@
       return;
     }
     if (action === "set-capital") {
-      // Toggle inline form — no prompt() which browsers block silently
-      const form = document.getElementById("capital-form-" + id);
-      if (!form) return;
-      const visible = form.style.display !== "none";
-      form.style.display = visible ? "none" : "flex";
-      if (!visible) {
-        const inp = document.getElementById("capital-input-" + id);
-        if (inp) { inp.focus(); inp.select(); }
-      }
-      return;
-    }
-    if (action === "save-capital") {
-      const inp = document.getElementById("capital-input-" + id);
-      const raw = inp ? inp.value.trim() : "";
-      const val = raw === "" ? null : parseFloat(raw);
-      if (val !== null && (isNaN(val) || val <= 0)) {
-        setBotMsg(id, "❌ Introduce un número positivo o deja vacío para usar todo el saldo", "var(--bad)", 10000);
-        return;
-      }
-      btn.disabled = true;
-      btn.textContent = "guardando…";
-      try {
-        await api(`/api/bots/${encodeURIComponent(id)}/config`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ target_usd: val }),
-        });
-        const form = document.getElementById("capital-form-" + id);
-        if (form) form.style.display = "none";
-        setBotMsg(id, val ? `✅ Capital limitado a $${Math.round(val)}` : "✅ Capital: todo disponible", "var(--good)");
-        await refreshAll();
-      } catch (e) {
-        setBotMsg(id, "❌ " + (e.message || "error al guardar"), "var(--bad)", 15000);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "guardar";
-      }
-      return;
-    }
-    if (action === "cancel-capital") {
-      const form = document.getElementById("capital-form-" + id);
-      if (form) form.style.display = "none";
+      const currentTargetUsd = btn.dataset.targetUsd ? parseFloat(btn.dataset.targetUsd) : null;
+      openCapitalModal(id, Number.isFinite(currentTargetUsd) ? currentTargetUsd : null);
       return;
     }
   });
@@ -1790,15 +1808,37 @@
 
   OPEN_UPDATES.addEventListener("click", openUpdates);
   UPDATES_CLOSE.addEventListener("click", closeUpdates);
+  CAPITAL_CLOSE.addEventListener("click", closeCapitalModal);
+  CAPITAL_SAVE.addEventListener("click", async () => {
+    const raw = CAPITAL_MODAL_INPUT.value.trim();
+    const val = raw === "" ? null : parseFloat(raw);
+    if (val !== null && (!Number.isFinite(val) || val <= 0)) {
+      CAPITAL_MODAL_MSG.style.color = "var(--bad)";
+      CAPITAL_MODAL_MSG.textContent = "Introduce un número positivo o déjalo vacío para usar todo el saldo";
+      return;
+    }
+    await saveCapitalModal(val);
+  });
+  CAPITAL_CLEAR.addEventListener("click", async () => {
+    await saveCapitalModal(null);
+  });
+  CAPITAL_MODAL_INPUT.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      CAPITAL_SAVE.click();
+    }
+  });
 
   // Single backdrop/Escape handler that dispatches to whichever modal is open.
   MODAL_BACKDROP.addEventListener("click", () => {
+    if (CAPITAL_MODAL.classList.contains("open")) closeCapitalModal();
     if (STRATEGIES_MODAL.classList.contains("open")) closeStrategies();
     if (UPDATES_MODAL.classList.contains("open")) closeUpdates();
     if (MODAL.classList.contains("open")) closeConsole();
   });
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
+    if (CAPITAL_MODAL.classList.contains("open")) closeCapitalModal();
     if (STRATEGIES_MODAL.classList.contains("open")) closeStrategies();
     if (UPDATES_MODAL.classList.contains("open")) closeUpdates();
     if (MODAL.classList.contains("open")) closeConsole();

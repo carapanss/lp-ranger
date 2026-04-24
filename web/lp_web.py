@@ -1386,10 +1386,14 @@ class Handler(BaseHTTPRequestHandler):
             cfg = read_bot_config(bot_id)
             cfg["request_recapitalize"] = True
             ok, msg = write_bot_config(bot_id, cfg)
-            if ok:
-                self._send_json(200, {"ok": True, "message": "deploy requested — daemon will execute in the next cycle"})
-            else:
+            if not ok:
                 self._send_json(500, {"ok": False, "error": msg})
+                return
+            restarted, restart_msg = _systemctl("restart", bot_id)
+            if restarted:
+                self._send_json(200, {"ok": True, "message": "deploy requested — bot restarted"})
+            else:
+                self._send_json(500, {"ok": False, "error": restart_msg or "bot restart failed"})
             return
 
         self._send_json(404, {"ok": False, "error": "not found"})
