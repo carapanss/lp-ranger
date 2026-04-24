@@ -651,15 +651,17 @@
     `;
   }
 
-  function renderStrategyPerfTable(rows, title = "Strategy APR") {
+  function renderStrategyPerfTable(rows, title = "Strategy TWR") {
     if (!rows || !rows.length) return "";
     const body = rows.map(row => `
       <tr>
         <td class="${row.is_current ? "current" : ""}">${esc(row.strategy)}${row.is_current ? " *" : ""}</td>
         <td>${fmtPct(row.apr_pct)}</td>
+        <td>${fmtPct(row.twr_pct)}</td>
         <td>${fmtMoney(row.pnl_usd)}</td>
         <td>${row.tracked_days != null ? Number(row.tracked_days).toFixed(1) + " d" : "—"}</td>
         <td>${row.sessions ?? "—"}</td>
+        <td>${row.cash_flow_count ?? 0}</td>
       </tr>
     `).join("");
     return `
@@ -669,14 +671,17 @@
           <thead>
             <tr>
               <th>Strategy</th>
-              <th>APR</th>
+              <th>APR TWR</th>
+              <th>TWR</th>
               <th>PnL</th>
               <th>Days</th>
               <th>Sessions</th>
+              <th>Flows</th>
             </tr>
           </thead>
           <tbody>${body}</tbody>
         </table>
+        <div class="perf-note">APR TWR anualiza el retorno time-weighted, ajustado por cash in/out detectados en la pool.</div>
       </div>
     `;
   }
@@ -740,9 +745,11 @@
         <thead>
           <tr>
             <th>Strategy</th>
-            <th>APR</th>
+            <th>APR TWR</th>
+            <th>TWR</th>
             <th>PnL</th>
             <th>Days</th>
+            <th>Flows</th>
           </tr>
         </thead>
         <tbody>
@@ -750,8 +757,10 @@
             <tr>
               <td class="${row.is_current ? "current" : ""}">${esc(row.strategy)}${row.is_current ? " *" : ""}</td>
               <td>${fmtPct(row.apr_pct)}</td>
+              <td>${fmtPct(row.twr_pct)}</td>
               <td>${fmtMoney(row.pnl_usd)}</td>
               <td>${Number(row.tracked_days || 0).toFixed(1)} d</td>
+              <td>${row.cash_flow_count ?? 0}</td>
             </tr>
           `).join("")}
         </tbody>
@@ -951,47 +960,15 @@
         summaryStats.aprPct = trackedDays > 0
           ? summaryStats.gainPct * (365 / trackedDays)
           : null;
-        const strategyAgg = new Map();
+        const botStrategyTables = [];
         for (const p of active) {
           if (!botsSet.has(p.id)) continue;
           const payload = payloadById.get(p.id);
-          if (!payload) continue;
-          for (const row of (payload.strategy_performance || [])) {
-            const cur = strategyAgg.get(row.strategy) || {
-              strategy: row.strategy,
-              fees_usd: 0,
-              il_usd: 0,
-              pnl_usd: 0,
-              tracked_seconds: 0,
-              capital_seconds: 0,
-              sessions: 0,
-              is_current: false,
-            };
-            cur.fees_usd += Number(row.fees_usd || 0);
-            cur.il_usd += Number(row.il_usd || 0);
-            cur.pnl_usd += Number(row.pnl_usd || 0);
-            cur.tracked_seconds += Number(row.tracked_days || 0) * 86400;
-            cur.sessions += Number(row.sessions || 0);
-            cur.capital_seconds += Number(row.capital_seconds || 0);
-            cur.is_current = cur.is_current || !!row.is_current;
-            strategyAgg.set(row.strategy, cur);
-          }
+          if (!payload || !(payload.strategy_performance || []).length) continue;
+          botStrategyTables.push(renderStrategyPerfTable(payload.strategy_performance, `TWR real por estrategia · bot #${p.id}`));
         }
-        const strategyRows = [...strategyAgg.values()].map(row => {
-          const aprPct = row.capital_seconds > 0
-            ? ((row.pnl_usd * 365 * 86400) / row.capital_seconds) * 100
-            : null;
-          return {
-            strategy: row.strategy,
-            pnl_usd: row.pnl_usd,
-            tracked_days: row.tracked_seconds / 86400,
-            sessions: row.sessions,
-            apr_pct: aprPct,
-            is_current: row.is_current,
-          };
-        }).sort((a, b) => (b.apr_pct ?? -Infinity) - (a.apr_pct ?? -Infinity));
 
-        walletSummary.innerHTML = renderWalletSummary(summaryStats) + renderStrategyPerfTable(strategyRows, "APR real por estrategia");
+        walletSummary.innerHTML = renderWalletSummary(summaryStats) + botStrategyTables.join("");
         walletSummary.style.display = "";
       } else {
         walletSummary.style.display = "none";

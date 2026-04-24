@@ -262,17 +262,29 @@ def _state_position_value_usd(state: dict | None) -> float | None:
     liq = int(state.get("position_liquidity", 0) or 0)
     tick_lo = state.get("position_tick_lower")
     tick_hi = state.get("position_tick_upper")
+    price = _state_price_usd(state)
+    if not liq or tick_lo is None or tick_hi is None or price is None:
+        return None
+    return _position_value_usd_from_parts(liq, tick_lo, tick_hi, price)
+
+
+def _state_price_usd(state: dict | None) -> float | None:
+    if not isinstance(state, dict):
+        return None
     history = state.get("price_history") or []
-    if not liq or tick_lo is None or tick_hi is None or not history:
+    if not history:
         return None
     try:
-        price = float(history[-1]["p"])
-        tick_lo = int(tick_lo)
-        tick_hi = int(tick_hi)
+        return float(history[-1]["p"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _position_value_usd_from_parts(liq: int, tick_lo: int, tick_hi: int, price: float) -> float | None:
     if price <= 0:
         return None
+    tick_lo = int(tick_lo)
+    tick_hi = int(tick_hi)
     if tick_lo > tick_hi:
         tick_lo, tick_hi = tick_hi, tick_lo
     raw = price / 1e12
@@ -322,13 +334,94 @@ def _ensure_strategy_entry(entries: dict, strategy: str) -> dict:
     entry.setdefault("fees_usd", 0.0)
     entry.setdefault("il_usd", 0.0)
     entry.setdefault("tracked_seconds", 0.0)
-    entry.setdefault("capital_seconds", 0.0)
     entry.setdefault("sessions", 0)
     entry.setdefault("last_capital_usd", None)
+    entry.setdefault("cash_flows", [])
+    entry.setdefault("cash_in_usd", 0.0)
+    entry.setdefault("cash_out_usd", 0.0)
+    entry.setdefault("twr_factor", 1.0)
     return entry
 
 
-def _finalize_strategy_snapshot(data: dict, state: dict | None, now: float) -> None:
+def _record_cash_flow(entry: dict, now: float, amount_usd: float, kind: str, note: str) -> None:
+    flow = {
+        "ts": int(now),
+        "amount_usd": round(amount_usd, 2),
+        "kind": kind,
+        "note": note,
+    }
+    flows = entry.setdefault("cash_flows", [])
+    flows.append(flow)
+    entry["cash_flows"] = flows[-100:]
+    if amount_usd >= 0:
+        entry["cash_in_usd"] += amount_usd
+    else:
+        entry["cash_out_usd"] += abs(amount_usd)
+
+
+def _position_snapshot(state: dict | None) -> dict:
+    if not isinstance(state, dict):
+        return {"position_id": None, "liquidity": 0, "tick_lower": None, "tick_upper": None, "price": None, "capital_usd": None}
+    snap = {
+        "position_id": str(state.get("position_id") or ""),
+        "liquidity": int(state.get("position_liquidity", 0) or 0),
+        "tick_lower": state.get("position_tick_lower"),
+        "tick_upper": state.get("position_tick_upper"),
+        "price": _state_price_usd(state),
+    }
+    if snap["liquidity"] and snap["tick_lower"] is not None and snap["tick_upper"] is not None and snap["price"] is not None:
+        snap["capital_usd"] = _position_value_usd_from_parts(snap["liquidity"], snap["tick_lower"], snap["tick_upper"], snap["price"])
+    else:
+        snap["capital_usd"] = None
+    return snap
+
+
+def _cash_flow_delta(current: dict, snapshot: dict) -> tuple[float | None, str | None]:
+    if not current or not snapshot:
+        return None, None
+    prev_pid = str(current.get("position_id") or "")
+    cur_pid = str(snapshot.get("position_id") or "")
+    prev_liq = int(current.get("position_liquidity", 0) or 0)
+    cur_liq = int(snapshot.get("liquidity", 0) or 0)
+    prev_tick_lo = current.get("position_tick_lower")
+    prev_tick_hi = current.get("position_tick_upper")
+    cur_tick_lo = snapshot.get("tick_lower")
+    cur_tick_hi = snapshot.get("tick_upper")
+    cur_price = snapshot.get("price")
+    cur_capital = snapshot.get("capital_usd")
+    if cur_price is None or cur_capital is None:
+        return None, None
+    if (
+        prev_pid
+        and cur_pid
+        and prev_pid == cur_pid
+        and prev_liq != cur_liq
+        and prev_liq > 0
+        and prev_tick_lo is not None
+        and prev_tick_hi is not None
+    ):
+        prev_capital_now = _position_value_usd_from_parts(prev_liq, prev_tick_lo, prev_tick_hi, cur_price)
+        if prev_capital_now is None:
+            return None, None
+        delta = cur_capital - prev_capital_now
+        if abs(delta) >= max(5.0, prev_capital_now * 0.01):
+            return delta, "liquidity_change"
+    return None, None
+
+
+def _apply_return_segment(entry: dict, current: dict, now: float, net_pnl_delta: float) -> None:
+    last_update_at = float(current.get("last_update_at", now) or now)
+    dt = max(0.0, now - last_update_at)
+    base_capital = float(current.get("base_capital_usd", 0) or 0)
+    if dt > 0:
+        entry["tracked_seconds"] += dt
+    if base_capital > 0 and dt > 0:
+        segment_return = net_pnl_delta / base_capital
+        entry["twr_factor"] *= (1.0 + segment_return)
+        entry["last_capital_usd"] = round(base_capital, 2)
+
+
+def _finalize_strategy_snapshot(data: dict, state: dict | None, now: float, close_session: bool = False) -> None:
     current = data.get("current")
     if not isinstance(current, dict):
         return
@@ -336,34 +429,38 @@ def _finalize_strategy_snapshot(data: dict, state: dict | None, now: float) -> N
     if not strategy or not isinstance(state, dict):
         return
     entry = _ensure_strategy_entry(data["entries"], strategy)
-    last_update_at = float(current.get("last_update_at", now) or now)
-    dt = max(0.0, now - last_update_at)
     fees_now = float(state.get("total_fees", 0) or 0)
     il_now = float(state.get("total_il", 0) or 0)
     prev_fees = float(current.get("last_fees_usd", fees_now) or fees_now)
     prev_il = float(current.get("last_il_usd", il_now) or il_now)
     fees_delta = fees_now - prev_fees
     il_delta = il_now - prev_il
-    capital_usd = _state_position_value_usd(state)
-    if capital_usd is None:
-        capital_usd = current.get("last_capital_usd")
-    if dt > 0:
-        entry["tracked_seconds"] += dt
-        if capital_usd and capital_usd > 0:
-            entry["capital_seconds"] += float(capital_usd) * dt
-            entry["last_capital_usd"] = round(float(capital_usd), 2)
     if fees_delta >= 0:
         entry["fees_usd"] += fees_delta
     else:
-        current["session_reset"] = True
+        fees_delta = 0.0
     if il_delta >= 0:
         entry["il_usd"] += il_delta
     else:
-        current["session_reset"] = True
+        il_delta = 0.0
+    net_pnl_delta = fees_delta - il_delta
+    snapshot = _position_snapshot(state)
+    flow_delta, flow_note = _cash_flow_delta(current, snapshot)
+    if flow_delta is not None:
+        _apply_return_segment(entry, current, now, net_pnl_delta)
+        _record_cash_flow(entry, now, flow_delta, "in" if flow_delta > 0 else "out", flow_note or "cash_flow")
+        current["base_capital_usd"] = max(0.0, float(current.get("base_capital_usd", 0) or 0) + flow_delta)
+        net_pnl_delta = 0.0
+    _apply_return_segment(entry, current, now, net_pnl_delta)
+    current["base_capital_usd"] = snapshot.get("capital_usd")
     current["last_update_at"] = now
     current["last_fees_usd"] = fees_now
     current["last_il_usd"] = il_now
-    current["last_capital_usd"] = capital_usd
+    current["last_capital_usd"] = snapshot.get("capital_usd")
+    current["position_id"] = snapshot.get("position_id")
+    current["position_liquidity"] = snapshot.get("liquidity")
+    current["position_tick_lower"] = snapshot.get("tick_lower")
+    current["position_tick_upper"] = snapshot.get("tick_upper")
 
 
 def _activate_strategy(data: dict, strategy: str, state: dict | None, now: float) -> None:
@@ -371,14 +468,19 @@ def _activate_strategy(data: dict, strategy: str, state: dict | None, now: float
     entry["sessions"] += 1
     fees_now = float((state or {}).get("total_fees", 0) or 0)
     il_now = float((state or {}).get("total_il", 0) or 0)
-    capital_usd = _state_position_value_usd(state)
+    snapshot = _position_snapshot(state)
     data["current"] = {
         "strategy": strategy,
         "started_at": now,
         "last_update_at": now,
         "last_fees_usd": fees_now,
         "last_il_usd": il_now,
-        "last_capital_usd": capital_usd,
+        "last_capital_usd": snapshot.get("capital_usd"),
+        "base_capital_usd": snapshot.get("capital_usd"),
+        "position_id": snapshot.get("position_id"),
+        "position_liquidity": snapshot.get("liquidity"),
+        "position_tick_lower": snapshot.get("tick_lower"),
+        "position_tick_upper": snapshot.get("tick_upper"),
     }
 
 
@@ -400,23 +502,26 @@ def update_strategy_performance(bot_id: str, state: dict | None, strategy_name: 
             fees = float(entry.get("fees_usd", 0) or 0)
             il = float(entry.get("il_usd", 0) or 0)
             tracked_seconds = float(entry.get("tracked_seconds", 0) or 0)
-            capital_seconds = float(entry.get("capital_seconds", 0) or 0)
+            twr_factor = float(entry.get("twr_factor", 1.0) or 1.0)
             apr_pct = None
-            if capital_seconds > 0 and tracked_seconds > 0:
-                apr_pct = ((fees - il) * 365 * 86400 / capital_seconds) * 100
+            if tracked_seconds > 0 and twr_factor > 0:
+                apr_pct = ((twr_factor ** (365 * 86400 / tracked_seconds)) - 1.0) * 100
             rows.append({
                 "strategy": strategy,
                 "fees_usd": round(fees, 2),
                 "il_usd": round(il, 2),
                 "pnl_usd": round(fees - il, 2),
                 "tracked_days": round(tracked_seconds / 86400, 2) if tracked_seconds > 0 else 0,
-                "capital_seconds": round(capital_seconds, 2),
                 "sessions": int(entry.get("sessions", 0) or 0),
                 "last_capital_usd": entry.get("last_capital_usd"),
+                "cash_in_usd": round(float(entry.get("cash_in_usd", 0) or 0), 2),
+                "cash_out_usd": round(float(entry.get("cash_out_usd", 0) or 0), 2),
+                "cash_flow_count": len(entry.get("cash_flows", []) or []),
+                "twr_pct": round((twr_factor - 1.0) * 100, 2),
                 "apr_pct": round(apr_pct, 2) if apr_pct is not None else None,
                 "is_current": bool(isinstance(data.get("current"), dict) and data["current"].get("strategy") == strategy),
             })
-        rows.sort(key=lambda row: (row["apr_pct"] is None, -(row["apr_pct"] or 0), -(row["pnl_usd"] or 0)))
+        rows.sort(key=lambda row: (row["apr_pct"] is None, -(row["apr_pct"] or 0), -(row["twr_pct"] or 0)))
         return rows
 
 
@@ -424,7 +529,7 @@ def close_strategy_performance_session(bot_id: str, state: dict | None) -> None:
     with _strategy_perf_lock:
         data = _load_strategy_performance(bot_id)
         if isinstance(data.get("current"), dict):
-            _finalize_strategy_snapshot(data, state, time.time())
+            _finalize_strategy_snapshot(data, state, time.time(), close_session=True)
             data["current"] = None
             _save_strategy_performance(bot_id, data)
 
