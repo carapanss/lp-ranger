@@ -660,47 +660,71 @@
     return (kb / 1024).toFixed(0) + " MB";
   }
 
-  // Simple full-width RAM chart with subtle reference bands.
+  function fmtRamTick(kb) {
+    if (!kb || kb <= 0) return "0 MB";
+    const mb = kb / 1024;
+    return mb >= 100 ? mb.toFixed(0) + " MB" : mb.toFixed(1) + " MB";
+  }
+
   function ramChartSvg(history) {
     if (!history || history.length < 2) return "";
-    const vals = history.map(h => h.kb);
-    const TOTAL_KB = 512 * 1024, WARN_KB = 200 * 1024, CRIT_KB = 400 * 1024;
+    const vals = history.map(h => Number(h.kb) || 0).filter(v => v > 0);
+    if (vals.length < 2) return "";
+    const WARN_KB = 200 * 1024, CRIT_KB = 400 * 1024;
     const maxVal = Math.max(...vals);
-    const W = 1000, H = 76, pad = 6, iH = H - pad * 2;
+    const minVal = Math.min(...vals);
+    const curVal = vals[vals.length - 1];
+    const range = Math.max(maxVal - minVal, 8 * 1024);
+    const domainPad = Math.max(range * 0.18, 6 * 1024);
+    const domainMin = Math.max(0, minVal - domainPad);
+    const domainMax = Math.max(maxVal + domainPad, domainMin + 16 * 1024);
+    const domainSpan = domainMax - domainMin;
+    const W = 1000, H = 120;
+    const padL = 12, padR = 12, padT = 10, padB = 20;
+    const plotX = 78, plotY = padT;
+    const plotW = W - plotX - padR;
+    const plotH = H - padT - padB;
 
-    const sy = v => pad + iH * (1 - v / TOTAL_KB);
-    const sx = i => (i / Math.max(vals.length - 1, 1)) * W;
+    const sy = v => plotY + plotH * (1 - ((v - domainMin) / domainSpan));
+    const sx = i => plotX + (i / Math.max(vals.length - 1, 1)) * plotW;
 
-    const pts  = vals.map((v, i) => `${sx(i).toFixed(0)},${sy(v).toFixed(1)}`).join(" ");
-    const area = `0,${(pad + iH).toFixed(1)} ${pts} ${W},${(pad + iH).toFixed(1)}`;
+    const pts = vals.map((v, i) => `${sx(i).toFixed(1)},${sy(v).toFixed(1)}`).join(" ");
+    const area = `${plotX},${(plotY + plotH).toFixed(1)} ${pts} ${plotX + plotW},${(plotY + plotH).toFixed(1)}`;
+    const lineColor = maxVal > CRIT_KB ? "#f85149" : maxVal > WARN_KB ? "#f0883e" : "#3fb950";
+    const fillColor = maxVal > CRIT_KB ? "rgba(248,81,73,.12)" : maxVal > WARN_KB ? "rgba(240,136,62,.12)" : "rgba(63,185,80,.12)";
 
-    const lc = maxVal > CRIT_KB ? "#f85149" : maxVal > WARN_KB ? "#f0883e" : "#3fb950";
-    const fc = maxVal > CRIT_KB ? "rgba(248,81,73,.12)" : maxVal > WARN_KB ? "rgba(240,136,62,.12)" : "rgba(63,185,80,.12)";
+    const tickValues = [domainMax, domainMin + domainSpan / 2, domainMin].map(v => Math.round(v));
+    const grid = tickValues.map(v => `
+      <line x1="${plotX}" y1="${sy(v).toFixed(1)}" x2="${plotX + plotW}" y2="${sy(v).toFixed(1)}" stroke="rgba(148,163,184,.14)" stroke-width="1"/>
+      <text x="${plotX - 10}" y="${(sy(v) + 4).toFixed(1)}" text-anchor="end" fill="var(--muted)" font-size="13">${fmtRamTick(v)}</text>
+    `).join("");
 
-    const bands = `
-      <rect x="0" y="${sy(CRIT_KB).toFixed(1)}" width="${W}" height="${(sy(WARN_KB) - sy(CRIT_KB)).toFixed(1)}" fill="rgba(240,136,62,.06)"/>
-      <rect x="0" y="${pad}" width="${W}" height="${(sy(CRIT_KB) - pad).toFixed(1)}" fill="rgba(248,81,73,.06)"/>
-    `;
-    const refs = [
-      [WARN_KB, "#f0883e", 0.35],
-      [CRIT_KB, "#f85149", 0.35],
-    ].map(([v, clr, op]) =>
-      `<line x1="0" y1="${sy(v).toFixed(1)}" x2="${W}" y2="${sy(v).toFixed(1)}" stroke="${clr}" stroke-width="1.2" opacity="${op}"/>`
-    ).join("");
+    const refLines = [
+      [WARN_KB, "#f0883e", "warn"],
+      [CRIT_KB, "#f85149", "crit"],
+    ].filter(([v]) => v >= domainMin && v <= domainMax).map(([v, clr, label]) => `
+      <line x1="${plotX}" y1="${sy(v).toFixed(1)}" x2="${plotX + plotW}" y2="${sy(v).toFixed(1)}" stroke="${clr}" stroke-width="1.2" stroke-dasharray="5 5" opacity="0.45"/>
+      <text x="${plotX + plotW - 4}" y="${(sy(v) - 6).toFixed(1)}" text-anchor="end" fill="${clr}" font-size="12" opacity="0.9">${label} ${fmtRam(v)}</text>
+    `).join("");
 
     const maxIdx = vals.lastIndexOf(maxVal);
-    const curX = sx(vals.length-1).toFixed(0), curY = sy(vals[vals.length-1]).toFixed(1);
-    const mX = sx(maxIdx).toFixed(0), mY = sy(maxVal).toFixed(1);
-    const mCircle = maxVal !== vals[vals.length-1]
-      ? `<circle cx="${mX}" cy="${mY}" r="5" fill="${lc}" opacity=".85"/>` : "";
+    const curX = sx(vals.length - 1).toFixed(1), curY = sy(curVal).toFixed(1);
+    const peakX = sx(maxIdx).toFixed(1), peakY = sy(maxVal).toFixed(1);
+    const peakMarker = maxIdx !== vals.length - 1
+      ? `<circle cx="${peakX}" cy="${peakY}" r="4.5" fill="${lineColor}" opacity=".9"/>`
+      : "";
+    const startLabel = history[0]?.t ? "4h ago" : "";
     return `<div style="position:relative;width:100%;height:${H}px;margin:0.35rem 0 0">
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;width:100%;height:100%">
-        <rect width="${W}" height="${H}" fill="var(--bg)" rx="4"/>
-        ${bands}
-        ${refs}
-        <polygon points="${area}" fill="${fc}"/>
-        <polyline points="${pts}" fill="none" stroke="${lc}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
-        ${mCircle}<circle cx="${curX}" cy="${curY}" r="5" fill="${lc}"/>
+        <rect width="${W}" height="${H}" fill="rgba(15,23,42,.22)" rx="8"/>
+        ${grid}
+        ${refLines}
+        <polygon points="${area}" fill="${fillColor}"/>
+        <polyline points="${pts}" fill="none" stroke="${lineColor}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+        ${peakMarker}
+        <circle cx="${curX}" cy="${curY}" r="5" fill="${lineColor}"/>
+        <text x="${plotX}" y="${H - 6}" fill="var(--muted)" font-size="12">${startLabel}</text>
+        <text x="${plotX + plotW}" y="${H - 6}" text-anchor="end" fill="var(--muted)" font-size="12">now</text>
       </svg>
     </div>`;
   }
@@ -898,7 +922,7 @@
     const ramSummary = ramKb
       ? `<div style="display:flex;justify-content:space-between;font-size:0.72rem;color:var(--muted);margin-bottom:0.1rem">
            <span>RAM · <span style="color:${ramLineColor};font-weight:600">${fmtRam(ramKb)}</span> actual · pico <span style="color:${ramLineColor}">${fmtRam(ramMax)}</span> · mín ${fmtRam(ramMin)}</span>
-           <span style="opacity:.6">${ramHist.length} ciclos · 512 MB total</span>
+           <span style="opacity:.6">${ramHist.length} ciclos · escala auto · warn 200 MB</span>
          </div>`
       : "";
     const ageLabel = cycleAge != null ? fmtAgo(cycleAge) : "—";

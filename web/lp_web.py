@@ -472,6 +472,27 @@ def _apply_return_segment(entry: dict, current: dict, now: float, net_pnl_delta:
         entry["last_capital_usd"] = round(base_capital, 2)
 
 
+def _annualized_twr_apr_pct(twr_factor: float, tracked_seconds: float) -> float | None:
+    """Return a sane annualized APR for TWR, or None when the sample is too short.
+
+    TWR annualization is extremely unstable over short windows. A small positive
+    return over minutes or hours explodes into meaningless APR figures, so we
+    hide it until there is enough tracked time to make the metric readable.
+    """
+    if not math.isfinite(twr_factor) or not math.isfinite(tracked_seconds):
+        return None
+    min_seconds = 7 * 86400
+    if tracked_seconds < min_seconds or tracked_seconds <= 0 or twr_factor <= 0:
+        return None
+    try:
+        apr_pct = math.expm1(math.log(twr_factor) * (365 * 86400 / tracked_seconds)) * 100.0
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(apr_pct):
+        return None
+    return apr_pct
+
+
 def _finalize_strategy_snapshot(data: dict, state: dict | None, now: float, close_session: bool = False) -> None:
     current = data.get("current")
     if not isinstance(current, dict):
@@ -554,9 +575,7 @@ def update_strategy_performance(bot_id: str, state: dict | None, strategy_name: 
             il = float(entry.get("il_usd", 0) or 0)
             tracked_seconds = float(entry.get("tracked_seconds", 0) or 0)
             twr_factor = float(entry.get("twr_factor", 1.0) or 1.0)
-            apr_pct = None
-            if tracked_seconds > 0 and twr_factor > 0:
-                apr_pct = ((twr_factor ** (365 * 86400 / tracked_seconds)) - 1.0) * 100
+            apr_pct = _annualized_twr_apr_pct(twr_factor, tracked_seconds)
             rows.append({
                 "strategy": strategy,
                 "fees_usd": round(fees, 2),
