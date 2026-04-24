@@ -1378,6 +1378,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"ok": False, "error": msg})
             return
 
+        if path.startswith("/api/bots/") and path.endswith("/deploy-capital"):
+            bot_id = path[len("/api/bots/"):-len("/deploy-capital")]
+            if not bot_id.isdigit():
+                self._send_json(400, {"ok": False, "error": "invalid bot id"})
+                return
+            cfg = read_bot_config(bot_id)
+            cfg["request_recapitalize"] = True
+            ok, msg = write_bot_config(bot_id, cfg)
+            if ok:
+                self._send_json(200, {"ok": True, "message": "deploy requested — daemon will execute in the next cycle"})
+            else:
+                self._send_json(500, {"ok": False, "error": msg})
+            return
+
         self._send_json(404, {"ok": False, "error": "not found"})
 
     # Treat PUT identically to POST for strategies (some clients prefer PUT for upserts).

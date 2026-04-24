@@ -713,7 +713,29 @@ def daemon_loop(args):
             _rsi_s = f"{_rsi:.0f}" if isinstance(_rsi,(int,float)) else "?"
             log(f"{status_sym.get(status,'?')} ETH ${price:,.0f} | Range ${rlo:,.0f}-${rhi:,.0f} | {status} | trend {det.get('trend_pct',0):+.1f}% | RSI {_rsi_s}")
 
-            # 4. Act if there's a signal
+            # 4a. User-requested capital deployment (bypasses cooldown).
+            # The web UI sets request_recapitalize=true in bot_config.json.
+            # We rebalance at the current range with all available capital.
+            if pool_active and rlo > 0 and rhi > 0:
+                cfg = _read_bot_config()
+                if cfg.get("request_recapitalize"):
+                    log("  💰 Capital deployment requested — rebalancing at current range (cooldown bypassed)")
+                    recap = {"type": "rebalance", "lo": rlo, "hi": rhi, "reason": "user-requested capital deployment"}
+                    success = execute_action(recap, state, pk=pk, dry_run=args.dry_run)
+                    if success:
+                        state.record_action(action_type="rebalance")
+                        state.set("range_lo", rlo)
+                        state.set("range_hi", rhi)
+                        log("  ✅ Capital deployment complete")
+                    # Always clear the flag, even on failure, to avoid loops
+                    cfg["request_recapitalize"] = False
+                    try:
+                        (DATA_DIR / "bot_config.json").write_text(
+                            json.dumps(cfg, indent=2))
+                    except OSError as e:
+                        log(f"Could not clear recapitalize flag: {e}", "WARN")
+
+            # 4b. Act if there's a strategy signal
             if action:
                 can, reason = state.can_act(action_type=action.get("type"))
                 if not can:

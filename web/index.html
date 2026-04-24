@@ -567,17 +567,16 @@
   }
 
   // SVG mini-chart showing RAM history against Pi Zero 2W total (512 MB).
-  // Reference lines at 200 MB (amber) and 400 MB (red).
+  // Labels are overlaid inside the chart so the plot starts flush left.
   function ramChartSvg(history, currentKb) {
     if (!history || history.length < 2) return "";
     const vals = history.map(h => h.kb);
-    const TOTAL_KB = 512 * 1024;  // Pi Zero 2W
+    const TOTAL_KB = 512 * 1024;
     const WARN_KB  = 200 * 1024;
     const CRIT_KB  = 400 * 1024;
     const maxVal = Math.max(...vals);
-    const minVal = Math.min(...vals);
     const W = 300, H = 70;
-    const padL = 28, padR = 4, padT = 8, padB = 2;
+    const padL = 2, padR = 2, padT = 8, padB = 2;
     const iW = W - padL - padR, iH = H - padT - padB;
 
     const sy = v => (padT + iH - (v / TOTAL_KB) * iH).toFixed(1);
@@ -586,7 +585,6 @@
     const line = vals.map((v, i) => `${sx(i)},${sy(v)}`).join(" ");
     const area = `${padL},${H - padB} ` + line + ` ${sx(vals.length - 1)},${H - padB}`;
 
-    const wY = sy(WARN_KB), cY = sy(CRIT_KB);
     const lineColor = maxVal > CRIT_KB ? "#f85149" : maxVal > WARN_KB ? "#f0883e" : "#3fb950";
     const fillClr   = maxVal > CRIT_KB ? "rgba(248,81,73,.12)" : maxVal > WARN_KB ? "rgba(240,136,62,.12)" : "rgba(63,185,80,.12)";
 
@@ -594,24 +592,29 @@
     const mX = sx(maxIdx), mY = sy(maxVal);
     const curX = sx(vals.length - 1), curY = sy(vals[vals.length - 1]);
 
-    // y-axis ticks
-    const ticks = [0, WARN_KB, CRIT_KB, TOTAL_KB].map(v => {
+    // Reference lines + labels overlaid inside the plot area
+    const refs = [
+      { v: TOTAL_KB, lbl: "512M", clr: "var(--muted)", dashed: false },
+      { v: CRIT_KB,  lbl: "400M", clr: "#f85149",      dashed: true },
+      { v: WARN_KB,  lbl: "200M", clr: "#f0883e",      dashed: true },
+      { v: 0,        lbl: "0",    clr: "var(--muted)", dashed: false },
+    ].map(({ v, lbl, clr, dashed }) => {
       const y = sy(v);
-      const lbl = v === 0 ? "0" : v === TOTAL_KB ? "512M" : v === WARN_KB ? "200M" : "400M";
-      const clr = v === WARN_KB ? "#f0883e" : v === CRIT_KB ? "#f85149" : "var(--muted)";
-      return `<text x="${padL - 3}" y="${(Number(y) + 3.5).toFixed(1)}" text-anchor="end" font-size="8" fill="${clr}" opacity=".8">${lbl}</text>
-              <line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="${clr}" stroke-width="${v===0||v===TOTAL_KB?'0.4':'0.8'}" stroke-dasharray="${v===0||v===TOTAL_KB?'':'3,3'}" opacity="${v===0||v===TOTAL_KB?'.3':'.5'}"/>`;
+      const dashAttr = dashed ? 'stroke-dasharray="3,3"' : '';
+      const opacity = dashed ? '.5' : '.25';
+      return `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="${clr}" stroke-width="${dashed ? '0.8' : '0.4'}" ${dashAttr} opacity="${opacity}"/>
+              <text x="${padL + 3}" y="${(Number(y) - 2).toFixed(1)}" font-size="8" fill="${clr}" opacity=".75">${lbl}</text>`;
     }).join("");
 
     const maxTag = maxVal !== vals[vals.length - 1]
       ? `<circle cx="${mX}" cy="${mY}" r="2.5" fill="${lineColor}" opacity=".85"/>
-         <text x="${Number(mX) > W/2 ? Number(mX)-4 : Number(mX)+4}" y="${Math.max(padT+7, Number(mY)-4)}" text-anchor="${Number(mX) > W/2 ? 'end' : 'start'}" font-size="8" fill="${lineColor}" opacity=".9">▲${fmtRam(maxVal)}</text>`
+         <text x="${Number(mX) > W * 0.6 ? Number(mX) - 4 : Number(mX) + 4}" y="${Math.max(padT + 7, Number(mY) - 3)}" text-anchor="${Number(mX) > W * 0.6 ? 'end' : 'start'}" font-size="8" fill="${lineColor}" opacity=".9">▲${fmtRam(maxVal)}</text>`
       : "";
 
-    return `<div style="margin:0.6rem 0 0.2rem 0">
-      <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block;overflow:visible" aria-label="RAM history">
-        <rect x="${padL}" y="${padT}" width="${iW}" height="${iH}" fill="var(--bg)" rx="2"/>
-        ${ticks}
+    return `<div style="margin:0.5rem 0 0.2rem 0">
+      <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block" aria-label="RAM history">
+        <rect width="${W}" height="${H}" fill="var(--bg)" rx="2"/>
+        ${refs}
         <polygon points="${area}" fill="${fillClr}"/>
         <polyline points="${line}" fill="none" stroke="${lineColor}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
         ${maxTag}
@@ -834,7 +837,7 @@
       <dl>
         <dt>ETH</dt><dd>${fmtUSD(lastPrice)}</dd>
         <dt>Range</dt><dd>${fmtUSD(st.range_lo)} – ${fmtUSD(st.range_hi)}</dd>
-        <dt>Capital pool</dt><dd>${capitalLabel}</dd>
+        <dt>Capital pool</dt><dd>${capitalLabel} <button class="ghost" data-action="deploy-capital" data-id="${id}" style="font-size:0.72rem;padding:0.15rem 0.45rem;margin-left:0.3rem" title="Rebalancear ahora con todo el capital disponible (ignora cooldown)">deploy</button></dd>
         <dt>Cooldown</dt><dd>${fmtDur(cooldownRemaining(st.last_action_time))}</dd>
         <dt>Pool</dt><dd>${esc(poolText)}</dd>
         <dt>Strategy</dt><dd>${esc(strategyName)}</dd>
@@ -1274,6 +1277,21 @@
         if (errEl) errEl.textContent = e.message || "ack failed";
         btn.disabled = false;
         btn.textContent = "seen";
+      }
+      return;
+    }
+    if (action === "deploy-capital") {
+      if (!confirm(`Rebalancear bot #${id} ahora con todo el capital disponible?\n(Ignora cooldown — ejecuta en el próximo ciclo del daemon, ~5 min)`)) return;
+      btn.disabled = true;
+      btn.textContent = "…";
+      try {
+        await api(`/api/bots/${encodeURIComponent(id)}/deploy-capital`, { method: "POST" });
+        if (errEl) { errEl.style.color = "var(--good)"; errEl.textContent = "Deploy solicitado — el daemon ejecutará en el próximo ciclo"; }
+      } catch (e) {
+        if (errEl) { errEl.style.color = ""; errEl.textContent = e.message || "error"; }
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "deploy";
       }
       return;
     }
