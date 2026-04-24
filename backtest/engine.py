@@ -44,27 +44,47 @@ class BacktestResult:
     elapsed_days: float = 0.0
 
 
-def _pool_value(position_usd_basis, range_lo, range_hi, entry_price, price):
-    """Mark-to-market of a concentrated LP position. Uses the V2 IL formula
-    times the V3 amplifier (via lp_core.il_estimate), which already caps
-    IL at 20% per segment to avoid runaway estimates.
+def _sqrt_price(price_usdc_per_eth):
+    raw = price_usdc_per_eth / 1e12
+    return raw ** 0.5
 
-    Returns the current USD value of the position.
-    """
-    if position_usd_basis <= 0 or range_lo <= 0 or range_hi <= 0 or price <= 0:
-        return position_usd_basis
-    # IL relative to the snapshot taken at entry_price (middle of range by default)
-    il_pct, _ = lp_core.il_estimate(range_lo, range_hi, price, position_usd_basis)
-    # The position tracks price: roughly (price/entry)^0.5 for the non-IL factor.
-    # For ranking consistency we approximate as: basis * (1 + (price/entry - 1) * 0.5) * (1 - il_pct)
-    # (Gives a smooth equity curve without requiring the full LP liquidity math.)
-    if entry_price <= 0:
-        return position_usd_basis
-    r = price / entry_price
-    # Underlying V2 50/50: value_factor = 2*sqrt(r)/(1+r)
-    import math
-    factor = 2 * math.sqrt(r) / (1 + r) if r > 0 else 1.0
-    return position_usd_basis * factor  # il_pct is already embedded in the V2 factor
+
+def _v3_amounts_from_liquidity(liquidity, range_lo, range_hi, price):
+    if liquidity <= 0 or range_lo <= 0 or range_hi <= 0 or price <= 0:
+        return 0.0, 0.0
+    sqrt_p = _sqrt_price(price)
+    sqrt_a = _sqrt_price(min(range_lo, range_hi))
+    sqrt_b = _sqrt_price(max(range_lo, range_hi))
+    if sqrt_p <= sqrt_a:
+        amount0 = liquidity * (sqrt_b - sqrt_a) / (sqrt_a * sqrt_b)
+        amount1 = 0.0
+    elif sqrt_p >= sqrt_b:
+        amount0 = 0.0
+        amount1 = liquidity * (sqrt_b - sqrt_a)
+    else:
+        amount0 = liquidity * (sqrt_b - sqrt_p) / (sqrt_p * sqrt_b)
+        amount1 = liquidity * (sqrt_p - sqrt_a)
+    weth = amount0 / 1e18
+    usdc = amount1 / 1e6
+    return weth, usdc
+
+
+def _v3_position_value(liquidity, range_lo, range_hi, price):
+    weth, usdc = _v3_amounts_from_liquidity(liquidity, range_lo, range_hi, price)
+    return weth * price + usdc
+
+
+def _open_position_from_capital(capital_usd, range_lo, range_hi, price):
+    """Convert USD capital into a V3 position at `price` for the target range."""
+    if capital_usd <= 0 or range_lo <= 0 or range_hi <= 0 or price <= 0:
+        return 0.0, 0.0, 0.0
+    unit_weth, unit_usdc = _v3_amounts_from_liquidity(1.0, range_lo, range_hi, price)
+    unit_value = unit_weth * price + unit_usdc
+    if unit_value <= 0:
+        return 0.0, 0.0, 0.0
+    liquidity = capital_usd / unit_value
+    weth, usdc = _v3_amounts_from_liquidity(liquidity, range_lo, range_hi, price)
+    return liquidity, weth, usdc
 
 
 def run_backtest(cfg, candles, *,
@@ -116,15 +136,13 @@ def run_backtest(cfg, candles, *,
     if not isinstance(execution, dict):
         execution = {}
     base_width_pct = float(p.get("base_width_pct", p.get("width_pct", 15)))
-    trend_shift = float(p.get("trend_shift", 0.4))
-    buffer_pct = float(p.get("buffer_pct", 5))
-    exit_trend_pct = float(p.get("exit_trend_pct", 10))
-    enter_trend_pct = float(p.get("enter_trend_pct", 2))
 
     range_lo = 0.0
     range_hi = 0.0
-    entry_price = 0.0
     pool_basis = 0.0
+    pool_liquidity = 0.0
+    entry_weth = 0.0
+    entry_usdc = 0.0
     cash_usd = position_usd
     eth_held = 0.0
     pool_active = False
@@ -147,6 +165,7 @@ def run_backtest(cfg, candles, *,
     if hours_per_candle <= 0:
         hours_per_candle = 1.0
     fee_per_tick_factor = hours_per_candle / 24.0
+    lend_per_tick_factor = hours_per_candle / HOURS_PER_YEAR
 
     equity_curve: list[tuple[int, float]] = []
     total_fees = 0.0
@@ -158,8 +177,6 @@ def run_backtest(cfg, candles, *,
     time_in_pool = 0
     time_in_eth = 0
     time_in_usdc = 0
-
-    import math as _m
 
     for idx, candle in enumerate(candles):
         t_ms = candle["t"]
@@ -176,14 +193,20 @@ def run_backtest(cfg, candles, *,
         ef = ema_fast_arr[idx] if warmed else None
         es = ema_slow_arr[idx] if warmed else None
         rs = rsi_arr[idx] if warmed else None
+        at = atr_arr[idx] if warmed else None
+        vp = ((at / price) * 100.0) if (at is not None and price > 0) else 0.0
 
         # Bootstrap a pool on the first warmed tick
         if (warmed and not pool_active and hold_asset == "USDC"
-                and eth_held == 0 and cash_usd > 0 and entry_price == 0):
-            range_lo = price * (1 - base_width_pct / 200)
-            range_hi = price * (1 + base_width_pct / 200)
-            entry_price = price
+                and eth_held == 0 and cash_usd > 0 and pool_liquidity == 0):
+            width_pct = lp_core.target_width_pct(p, trend_pct=0.0, rsi_value=rs, vol_pct=vp)
+            _, range_lo, range_hi = lp_core.target_center_and_range(
+                price, width_pct, float(p.get("trend_shift", 0.4)), False, 0.0
+            )
             pool_basis = cash_usd
+            pool_liquidity, entry_weth, entry_usdc = _open_position_from_capital(
+                pool_basis, range_lo, range_hi, price
+            )
             cash_usd = 0
             pool_active = True
             last_action_s = t_s
@@ -191,12 +214,17 @@ def run_backtest(cfg, candles, *,
             n_enters += 1
 
         # Mark-to-market
-        if pool_active and entry_price > 0 and price > 0:
-            r_p = price / entry_price
-            factor = 2 * _m.sqrt(r_p) / (1 + r_p) if r_p > 0 else 1.0
-            pool_mtm = pool_basis * factor
+        if pool_active and pool_liquidity > 0 and price > 0:
+            pool_mtm = _v3_position_value(pool_liquidity, range_lo, range_hi, price)
+            hold_mtm = entry_weth * price + entry_usdc
         else:
             pool_mtm = 0.0
+            hold_mtm = 0.0
+
+        if not pool_active:
+            cash_usd *= 1 + (float(p.get("idle_lend_usdc_apr", 0.0)) / 100.0) * lend_per_tick_factor
+            eth_held *= 1 + (float(p.get("idle_lend_eth_apr", 0.0)) / 100.0) * lend_per_tick_factor
+
         equity = pool_mtm + cash_usd + eth_held * price
         equity_curve.append((t_ms, equity))
 
@@ -225,42 +253,12 @@ def run_backtest(cfg, candles, *,
         tp = (ef - es) / es * 100
         tu = ef > es
 
-        action = None
-
-        if not pool_active:
-            if abs(tp) < enter_trend_pct:
-                hw = base_width_pct / 200
-                sh = hw * trend_shift * min(abs(tp) / 100 * 8, 1)
-                nc = price * (1 + sh) if tu else price * (1 - sh)
-                action = ("enter_pool",
-                          nc * (1 - base_width_pct / 200),
-                          nc * (1 + base_width_pct / 200),
-                          None)
-            elif hold_asset == "ETH" and rs is not None and rs < 35:
-                action = ("enter_pool",
-                          price * (1 - base_width_pct / 200),
-                          price * (1 + base_width_pct / 200),
-                          None)
-            elif hold_asset == "USDC" and rs is not None and rs > 65:
-                action = ("enter_pool",
-                          price * (1 - base_width_pct / 200),
-                          price * (1 + base_width_pct / 200),
-                          None)
-        else:
-            inr = range_lo <= price <= range_hi
-            if strategy_type == "exit_pool" and abs(tp) > exit_trend_pct:
-                action = ("exit_pool", 0, 0, "ETH" if tp > 0 else "USDC")
-            elif (not inr and
-                  (price < range_lo * (1 - buffer_pct / 100)
-                   or price > range_hi * (1 + buffer_pct / 100))):
-                hw = base_width_pct / 200
-                sh = hw * trend_shift * min(abs(tp) / 100 * 8, 1)
-                nc = price * (1 + sh) if tu else price * (1 - sh)
-                action = ("rebalance",
-                          nc * (1 - base_width_pct / 200),
-                          nc * (1 + base_width_pct / 200),
-                          None)
-
+        sig, action, _ = lp_core.evaluate_strategy_snapshot(
+            cfg, price,
+            {"range_lo": range_lo, "range_hi": range_hi,
+             "pool_active": pool_active, "hold_asset": hold_asset},
+            trend_up=tu, trend_pct=tp, rsi_value=rs, vol_pct=vp,
+        )
         if action is None:
             continue
         if t_s - last_action_s < cooldown_s:
@@ -268,38 +266,42 @@ def run_backtest(cfg, candles, *,
         if actions_today >= max_actions_per_day:
             continue
 
-        atype, alo, ahi, ahold = action
+        atype = action["type"]
         total_gas += gas_usd_per_action
         last_action_s = t_s
         actions_today += 1
 
         if atype == "rebalance":
-            _, il_usd = lp_core.il_estimate(range_lo, range_hi, price, pool_basis)
+            il_usd = max(hold_mtm - pool_mtm, 0.0)
             total_il += il_usd
-            pool_basis = pool_mtm - il_usd
+            pool_basis = pool_mtm
             if pool_basis < 0:
                 pool_basis = 0
-            range_lo = alo
-            range_hi = ahi
-            entry_price = price
+            range_lo = float(action["lo"])
+            range_hi = float(action["hi"])
+            pool_liquidity, entry_weth, entry_usdc = _open_position_from_capital(
+                pool_basis, range_lo, range_hi, price
+            )
             n_rebalances += 1
 
         elif atype == "exit_pool":
-            _, il_usd = lp_core.il_estimate(range_lo, range_hi, price, pool_basis)
+            il_usd = max(hold_mtm - pool_mtm, 0.0)
             total_il += il_usd
-            mtm = pool_mtm - il_usd
+            mtm = pool_mtm
             if mtm < 0:
                 mtm = 0
-            if ahold == "ETH":
+            if action["hold"] == "ETH":
                 eth_held += mtm / price if price > 0 else 0
                 hold_asset = "ETH"
             else:
                 cash_usd += mtm
                 hold_asset = "USDC"
             pool_basis = 0
+            pool_liquidity = 0
+            entry_weth = 0
+            entry_usdc = 0
             range_lo = 0
             range_hi = 0
-            entry_price = 0
             pool_active = False
             n_exits += 1
 
@@ -309,9 +311,11 @@ def run_backtest(cfg, candles, *,
                 eth_held = 0
             pool_basis = cash_usd
             cash_usd = 0
-            range_lo = alo
-            range_hi = ahi
-            entry_price = price
+            range_lo = float(action["lo"])
+            range_hi = float(action["hi"])
+            pool_liquidity, entry_weth, entry_usdc = _open_position_from_capital(
+                pool_basis, range_lo, range_hi, price
+            )
             pool_active = True
             hold_asset = "USDC"
             n_enters += 1

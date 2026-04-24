@@ -151,3 +151,38 @@ def test_il_bad_inputs_return_zero():
     assert lp_core.il_estimate(0, 0, 2200, 100) == (0.0, 0.0)
     assert lp_core.il_estimate(2100, 2300, 0, 100) == (0.0, 0.0)
     assert lp_core.il_estimate(2100, 2300, 2200, 0) == (0.0, 0.0)
+
+
+def test_target_width_pct_obeys_bounds():
+    params = {
+        "base_width_pct": 5,
+        "min_width_pct": 3,
+        "max_width_pct": 6,
+        "volatility_width_mult": 2.0,
+        "rsi_width_mult": 0.1,
+        "trend_width_mult": 0.5,
+    }
+    width = lp_core.target_width_pct(params, trend_pct=20, rsi_value=80, vol_pct=4)
+    assert 3 <= width <= 6
+    assert width == 6
+
+
+def test_snapshot_rebalances_in_range_when_target_drift_exceeds_threshold():
+    cfg = {
+        "strategy_type": "fixed",
+        "parameters": {
+            "base_width_pct": 5,
+            "width_pct": 5,
+            "trend_shift": 0.4,
+            "recenter_threshold_pct": 1.0,
+            "rewidth_threshold_pct": 1.0,
+        },
+    }
+    state = {"range_lo": 95, "range_hi": 105, "pool_active": True, "hold_asset": None}
+    sig, action, det = lp_core.evaluate_strategy_snapshot(
+        cfg, 100, state,
+        trend_up=True, trend_pct=20.0, rsi_value=60.0, vol_pct=1.0,
+    )
+    assert sig == "rebalance"
+    assert action["type"] == "rebalance"
+    assert det["center_drift_pct"] >= 1.0

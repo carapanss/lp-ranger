@@ -7,6 +7,17 @@ no GTK, no globals mutated) so it can be unit-tested in isolation.
 import math
 
 
+def _to_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 def validate_strategy(cfg):
     """Validate a strategy config dict. Returns a list of error strings
     (empty = valid). Callers should log errors and fall back to defaults
@@ -31,7 +42,16 @@ def validate_strategy(cfg):
     for key, lo, hi in (("buffer_pct", 0, 50),
                         ("trend_shift", 0, 2),
                         ("exit_trend_pct", 0, 50),
-                        ("enter_trend_pct", 0, 50)):
+                        ("enter_trend_pct", 0, 50),
+                        ("min_width_pct", 1, 100),
+                        ("max_width_pct", 1, 100),
+                        ("volatility_width_mult", -20, 20),
+                        ("trend_width_mult", -20, 20),
+                        ("rsi_width_mult", -2, 2),
+                        ("recenter_threshold_pct", 0, 50),
+                        ("rewidth_threshold_pct", 0, 50),
+                        ("idle_lend_usdc_apr", 0, 100),
+                        ("idle_lend_eth_apr", 0, 100)):
         v = params.get(key)
         if v is None:
             continue
@@ -48,6 +68,14 @@ def validate_strategy(cfg):
             continue
         if not (isinstance(v, int) and v > 0):
             errors.append(f"indicators.{key} must be a positive integer (got {v!r})")
+    min_w = params.get("min_width_pct")
+    max_w = params.get("max_width_pct")
+    if min_w is not None and max_w is not None:
+        try:
+            if float(min_w) > float(max_w):
+                errors.append(f"min_width_pct must be <= max_width_pct (got {min_w}>{max_w})")
+        except (TypeError, ValueError):
+            pass
     return errors
 
 
@@ -179,6 +207,129 @@ def il_estimate(old_lo, old_hi, current_price, position_value):
     return il_pct, il_pct * position_value
 
 
+def target_width_pct(params, *, trend_pct=0.0, rsi_value=None, vol_pct=0.0):
+    """Adaptive target width driven by volatility/trend/RSI, clamped to bounds."""
+    base_width = _to_float(params.get("base_width_pct", params.get("width_pct", 15)), 15)
+    width = base_width
+    width += _to_float(params.get("volatility_width_mult", 0.0)) * max(vol_pct, 0.0)
+    width += _to_float(params.get("trend_width_mult", 0.0)) * abs(trend_pct)
+    if rsi_value is not None:
+        width += _to_float(params.get("rsi_width_mult", 0.0)) * abs(rsi_value - 50.0)
+    min_width = _to_float(params.get("min_width_pct", 1.0), 1.0)
+    max_width = _to_float(params.get("max_width_pct", 100.0), 100.0)
+    if min_width > max_width:
+        min_width, max_width = max_width, min_width
+    return round(_clamp(width, min_width, max_width), 4)
+
+
+def target_center_and_range(price, width_pct, trend_shift, trend_up, trend_pct):
+    hw = width_pct / 200.0
+    sh = hw * trend_shift * min(abs(trend_pct) / 100.0 * 8.0, 1.0)
+    center = price * (1 + sh) if trend_up else price * (1 - sh)
+    lo = round(center * (1 - width_pct / 200.0), 2)
+    hi = round(center * (1 + width_pct / 200.0), 2)
+    return round(center, 4), lo, hi
+
+
+def evaluate_strategy_snapshot(cfg, price, state, *, trend_up, trend_pct, rsi_value, vol_pct):
+    """Signal engine using a precomputed indicator snapshot."""
+    p = cfg.get("parameters", {}) if isinstance(cfg, dict) else {}
+    st = cfg.get("strategy_type", "exit_pool") if isinstance(cfg, dict) else "exit_pool"
+
+    width_pct = target_width_pct(
+        p, trend_pct=trend_pct, rsi_value=rsi_value, vol_pct=vol_pct
+    )
+    trend_shift = _to_float(p.get("trend_shift", 0.4), 0.4)
+    center, target_lo, target_hi = target_center_and_range(
+        price, width_pct, trend_shift, trend_up, trend_pct
+    )
+
+    det = {
+        "target_width_pct": round(width_pct, 2),
+        "target_center_price": round(center, 2),
+    }
+
+    rlo = state.get("range_lo", 0) or 0
+    rhi = state.get("range_hi", 0) or 0
+    pool_active = state.get("pool_active", True)
+    hold_asset = state.get("hold_asset")
+
+    if not pool_active:
+        nt = _to_float(p.get("enter_trend_pct", 2), 2)
+        if abs(trend_pct) < nt:
+            return "enter", {"type": "enter_pool",
+                             "lo": target_lo,
+                             "hi": target_hi,
+                             "width": round(width_pct, 2),
+                             "reason": f"Lateralizacion (trend {trend_pct:+.1f}%)"}, det
+        h = hold_asset or "USDC"
+        if h == "ETH" and rsi_value is not None and rsi_value < 35:
+            return "enter", {"type": "enter_pool",
+                             "lo": target_lo,
+                             "hi": target_hi,
+                             "width": round(width_pct, 2),
+                             "reason": f"RSI {rsi_value:.0f}, reversion"}, det
+        if h == "USDC" and rsi_value is not None and rsi_value > 65:
+            return "enter", {"type": "enter_pool",
+                             "lo": target_lo,
+                             "hi": target_hi,
+                             "width": round(width_pct, 2),
+                             "reason": f"RSI {rsi_value:.0f}, reversion"}, det
+        return "closed", None, det
+
+    if rlo <= 0 or rhi <= 0:
+        det["message"] = "No range set"
+        return "gray", None, det
+
+    inr = rlo <= price <= rhi
+
+    if st == "exit_pool" and abs(trend_pct) > _to_float(p.get("exit_trend_pct", 10), 10):
+        h = "ETH" if trend_pct > 0 else "USDC"
+        return "exit", {"type": "exit_pool", "hold": h,
+                        "reason": f"Tendencia fuerte ({trend_pct:+.1f}%), exit -> {h}"}, det
+
+    buf = _to_float(p.get("buffer_pct", 5), 5) / 100.0
+    if not inr and (price < rlo * (1 - buf) or price > rhi * (1 + buf)):
+        return "rebalance", {"type": "rebalance",
+                             "lo": target_lo,
+                             "hi": target_hi,
+                             "width": round(width_pct, 2),
+                             "reason": f"Fuera de rango, trend {trend_pct:+.1f}%"}, det
+
+    if inr:
+        current_center = (rlo + rhi) / 2.0
+        current_width_pct = ((rhi - rlo) / current_center * 100.0) if current_center > 0 else 0.0
+        center_drift_pct = abs(current_center - center) / price * 100.0 if price > 0 else 0.0
+        width_gap_pct = abs(current_width_pct - width_pct)
+        det["center_drift_pct"] = round(center_drift_pct, 2)
+        det["width_gap_pct"] = round(width_gap_pct, 2)
+        recenter = _to_float(p.get("recenter_threshold_pct", 0.0), 0.0)
+        rewidth = _to_float(p.get("rewidth_threshold_pct", 0.0), 0.0)
+        if ((recenter > 0 and center_drift_pct >= recenter)
+                or (rewidth > 0 and width_gap_pct >= rewidth)):
+            reason_bits = []
+            if recenter > 0 and center_drift_pct >= recenter:
+                reason_bits.append(f"centro {center_drift_pct:.2f}%")
+            if rewidth > 0 and width_gap_pct >= rewidth:
+                reason_bits.append(f"ancho {width_gap_pct:.2f}%")
+            return "rebalance", {"type": "rebalance",
+                                 "lo": target_lo,
+                                 "hi": target_hi,
+                                 "width": round(width_pct, 2),
+                                 "reason": "Recenter in-range: " + ", ".join(reason_bits)}, det
+
+    if not inr:
+        return "yellow", None, det
+
+    rw = rhi - rlo
+    edge = min(price - rlo, rhi - price) / rw * 100 if rw > 0 else 0
+    det["edge_dist_pct"] = round(edge, 1)
+    if edge < 5:
+        return "yellow", None, det
+
+    return "green", None, det
+
+
 def evaluate_strategy(cfg, price, state, price_history):
     """Pure signal engine shared by lp_daemon and the backtest.
 
@@ -196,8 +347,6 @@ def evaluate_strategy(cfg, price, state, price_history):
           {hold: 'ETH'|'USDC', reason}  for exit_pool
       details: indicator snapshot (trend, trend_pct, rsi, ema_fast/slow, vol, atr).
     """
-    p = cfg.get("parameters", {}) if isinstance(cfg, dict) else {}
-    st = cfg.get("strategy_type", "exit_pool") if isinstance(cfg, dict) else "exit_pool"
     ic = cfg.get("data_sources", {}).get("indicators", {}) if isinstance(cfg, dict) else {}
 
     if price_history and isinstance(price_history[0], dict):
@@ -227,70 +376,9 @@ def evaluate_strategy(cfg, price, state, price_history):
            "vol": round(vp, 2),
            "atr": round(at, 2) if at is not None else None}
 
-    rlo = state.get("range_lo", 0) or 0
-    rhi = state.get("range_hi", 0) or 0
-    pool_active = state.get("pool_active", True)
-    hold_asset = state.get("hold_asset")
-
-    if not pool_active:
-        nt = p.get("enter_trend_pct", 2)
-        bw = p.get("base_width_pct", 15)
-        if abs(tp) < nt:
-            hw = bw / 200
-            ts2 = p.get("trend_shift", 0.4)
-            sh = hw * ts2 * min(abs(tp) / 100 * 8, 1)
-            nc = price * (1 + sh) if tu else price * (1 - sh)
-            return "enter", {"type": "enter_pool",
-                             "lo": round(nc * (1 - bw / 200), 2),
-                             "hi": round(nc * (1 + bw / 200), 2),
-                             "width": bw,
-                             "reason": f"Lateralizacion (trend {tp:+.1f}%)"}, det
-        h = hold_asset or "USDC"
-        if h == "ETH" and rs is not None and rs < 35:
-            return "enter", {"type": "enter_pool",
-                             "lo": round(price * (1 - bw / 200), 2),
-                             "hi": round(price * (1 + bw / 200), 2),
-                             "width": bw,
-                             "reason": f"RSI {rs:.0f}, reversion"}, det
-        if h == "USDC" and rs is not None and rs > 65:
-            return "enter", {"type": "enter_pool",
-                             "lo": round(price * (1 - bw / 200), 2),
-                             "hi": round(price * (1 + bw / 200), 2),
-                             "width": bw,
-                             "reason": f"RSI {rs:.0f}, reversion"}, det
-        return "closed", None, det
-
-    if rlo <= 0 or rhi <= 0:
-        det["message"] = "No range set"
-        return "gray", None, det
-
-    inr = rlo <= price <= rhi
-
-    if st == "exit_pool" and abs(tp) > p.get("exit_trend_pct", 10):
-        h = "ETH" if tp > 0 else "USDC"
-        return "exit", {"type": "exit_pool", "hold": h,
-                        "reason": f"Tendencia fuerte ({tp:+.1f}%), exit -> {h}"}, det
-
-    buf = p.get("buffer_pct", 5) / 100
-    if not inr and (price < rlo * (1 - buf) or price > rhi * (1 + buf)):
-        bw = p.get("base_width_pct", 15)
-        ts2 = p.get("trend_shift", 0.4)
-        hw = bw / 200
-        sh = hw * ts2 * min(abs(tp) / 100 * 8, 1)
-        nc = price * (1 + sh) if tu else price * (1 - sh)
-        return "rebalance", {"type": "rebalance",
-                             "lo": round(nc * (1 - bw / 200), 2),
-                             "hi": round(nc * (1 + bw / 200), 2),
-                             "width": bw,
-                             "reason": f"Fuera de rango, trend {tp:+.1f}%"}, det
-
-    if not inr:
-        return "yellow", None, det
-
-    rw = rhi - rlo
-    edge = min(price - rlo, rhi - price) / rw * 100 if rw > 0 else 0
-    det["edge_dist_pct"] = round(edge, 1)
-    if edge < 5:
-        return "yellow", None, det
-
-    return "green", None, det
+    sig, action, snapshot_det = evaluate_strategy_snapshot(
+        cfg, price, state,
+        trend_up=tu, trend_pct=tp, rsi_value=rs, vol_pct=vp,
+    )
+    det.update(snapshot_det)
+    return sig, action, det
