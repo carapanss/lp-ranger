@@ -583,60 +583,62 @@
     return (kb / 1024).toFixed(0) + " MB";
   }
 
-  // SVG mini-chart showing RAM history against Pi Zero 2W total (512 MB).
-  // Rendered inside the dl with grid-column:1/-1 so it spans full card width.
-  // Labels placed BELOW each reference line (never clipped by viewBox).
+  // RAM chart — preserveAspectRatio="none" fills 100% width; HTML <span>
+  // labels are absolutely-positioned so they never stretch with the SVG.
+  // SVG coordinate space: 1000×100 (shapes scale, labels don't).
   function ramChartSvg(history) {
     if (!history || history.length < 2) return "";
     const vals = history.map(h => h.kb);
-    const TOTAL_KB = 512 * 1024;
-    const WARN_KB  = 200 * 1024;
-    const CRIT_KB  = 400 * 1024;
+    const TOTAL_KB = 512 * 1024, WARN_KB = 200 * 1024, CRIT_KB = 400 * 1024;
     const maxVal = Math.max(...vals);
-    const W = 300, H = 90;
-    const padL = 2, padR = 2, padT = 4, padB = 14;  // padB leaves room for "0" label
-    const iW = W - padL - padR, iH = H - padT - padB;
+    const W = 1000, H = 100, padT = 8, padB = 18, iH = H - padT - padB;
 
-    const sy = v => (padT + iH - (v / TOTAL_KB) * iH).toFixed(1);
-    const sx = i => (padL + (i / (vals.length - 1)) * iW).toFixed(1);
+    const sy = v => padT + iH * (1 - v / TOTAL_KB);
+    const sx = i => (i / Math.max(vals.length - 1, 1)) * W;
 
-    const line = vals.map((v, i) => `${sx(i)},${sy(v)}`).join(" ");
-    const area = `${padL},${padT + iH} ` + line + ` ${sx(vals.length - 1)},${padT + iH}`;
+    const pts  = vals.map((v, i) => `${sx(i).toFixed(0)},${sy(v).toFixed(1)}`).join(" ");
+    const area = `0,${(padT + iH).toFixed(1)} ${pts} ${W},${(padT + iH).toFixed(1)}`;
 
-    const lineColor = maxVal > CRIT_KB ? "#f85149" : maxVal > WARN_KB ? "#f0883e" : "#3fb950";
-    const fillClr   = maxVal > CRIT_KB ? "rgba(248,81,73,.12)" : maxVal > WARN_KB ? "rgba(240,136,62,.12)" : "rgba(63,185,80,.12)";
+    const lc = maxVal > CRIT_KB ? "#f85149" : maxVal > WARN_KB ? "#f0883e" : "#3fb950";
+    const fc = maxVal > CRIT_KB ? "rgba(248,81,73,.12)" : maxVal > WARN_KB ? "rgba(240,136,62,.12)" : "rgba(63,185,80,.12)";
+
+    const refLines = [[TOTAL_KB,"var(--muted)",false],[CRIT_KB,"#f85149",true],[WARN_KB,"#f0883e",true],[0,"var(--muted)",false]]
+      .map(([v,clr,dashed]) => {
+        const y = sy(v).toFixed(1);
+        const dash = dashed ? `stroke-dasharray="20 15"` : "";
+        return `<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="${clr}" stroke-width="${dashed?2:1}" ${dash} opacity="${dashed?.5:.2}"/>`;
+      }).join("");
 
     const maxIdx = vals.lastIndexOf(maxVal);
-    const mX = sx(maxIdx), mY = sy(maxVal);
-    const curX = sx(vals.length - 1), curY = sy(vals[vals.length - 1]);
+    const curX = sx(vals.length-1).toFixed(0), curY = sy(vals[vals.length-1]).toFixed(1);
+    const mX = sx(maxIdx).toFixed(0), mY = sy(maxVal).toFixed(1);
+    const mCircle = maxVal !== vals[vals.length-1]
+      ? `<circle cx="${mX}" cy="${mY}" r="7" fill="${lc}" opacity=".85"/>` : "";
 
-    // Labels below each reference line so they're never clipped
-    const refs = [
-      { v: TOTAL_KB, lbl: "512M", clr: "var(--muted)", dashed: false },
-      { v: CRIT_KB,  lbl: "400M", clr: "#f85149",      dashed: true  },
-      { v: WARN_KB,  lbl: "200M", clr: "#f0883e",      dashed: true  },
-      { v: 0,        lbl: "0",    clr: "var(--muted)", dashed: false },
-    ].map(({ v, lbl, clr, dashed }) => {
-      const y = Number(sy(v));
-      const dash = dashed ? 'stroke-dasharray="3,3"' : '';
-      const lY = v === 0 ? y + 9 : y + 9;  // label always below the line
-      return `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W-padR}" y2="${y.toFixed(1)}" stroke="${clr}" stroke-width="${dashed?'0.8':'0.4'}" ${dash} opacity="${dashed?'.5':'.2'}"/>
-              <text x="${padL+3}" y="${lY.toFixed(1)}" font-size="8" fill="${clr}" opacity=".75">${lbl}</text>`;
-    }).join("");
+    // HTML labels — % coords so they align with the stretched SVG lines
+    const pct = (v, off=9) => ((sy(v) + off) / H * 100).toFixed(1);
+    const mXpct = (sx(maxIdx) / W * 100).toFixed(1);
+    const mYpct = Math.max(1, sy(maxVal) / H * 100 - 13).toFixed(1);
+    const mSide = Number(mXpct) > 60 ? `right:${(100-Number(mXpct)).toFixed(1)}%` : `left:${mXpct}%`;
+    const mLbl  = maxVal !== vals[vals.length-1]
+      ? `<span style="position:absolute;top:${mYpct}%;${mSide};font-size:9px;color:${lc};white-space:nowrap;line-height:1">▲${fmtRam(maxVal)}</span>` : "";
+    const lsp = (v, off=9, clr="var(--muted)") =>
+      `<span style="position:absolute;top:${pct(v,off)}%;left:3px;font-size:9px;color:${clr};opacity:.7;line-height:1">`;
 
-    const maxTag = maxVal !== vals[vals.length - 1]
-      ? `<circle cx="${mX}" cy="${mY}" r="2.5" fill="${lineColor}" opacity=".85"/>
-         <text x="${Number(mX)>W*.6?Number(mX)-4:Number(mX)+4}" y="${Math.max(padT+9,Number(mY)-3)}" text-anchor="${Number(mX)>W*.6?'end':'start'}" font-size="8" fill="${lineColor}" opacity=".9">▲${fmtRam(maxVal)}</text>`
-      : "";
-
-    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block" aria-label="RAM history">
-      <rect width="${W}" height="${H}" fill="var(--bg)" rx="2"/>
-      ${refs}
-      <polygon points="${area}" fill="${fillClr}"/>
-      <polyline points="${line}" fill="none" stroke="${lineColor}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
-      ${maxTag}
-      <circle cx="${curX}" cy="${curY}" r="2.5" fill="${lineColor}"/>
-    </svg>`;
+    return `<div style="position:relative;width:100%;height:${H}px;margin:0.4rem 0 0">
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;width:100%;height:100%">
+        <rect width="${W}" height="${H}" fill="var(--bg)" rx="4"/>
+        ${refLines}
+        <polygon points="${area}" fill="${fc}"/>
+        <polyline points="${pts}" fill="none" stroke="${lc}" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+        ${mCircle}<circle cx="${curX}" cy="${curY}" r="7" fill="${lc}"/>
+      </svg>
+      ${lsp(TOTAL_KB)}512M</span>
+      ${lsp(CRIT_KB,9,"#f85149")}400M</span>
+      ${lsp(WARN_KB,9,"#f0883e")}200M</span>
+      ${lsp(0,-13)}0</span>
+      ${mLbl}
+    </div>`;
   }
 
   function isValidWallet(s) {
@@ -840,6 +842,7 @@
     const cfg = payload.bot_config || {};
     const targetUsd = typeof cfg.target_usd === "number" && cfg.target_usd > 0 ? cfg.target_usd : null;
     const capitalLabel = targetUsd ? `<span style="color:var(--accent)">$${Math.round(targetUsd).toLocaleString()}</span>` : `<span style="color:var(--muted)">all available</span>`;
+    const deployPending = cfg.request_recapitalize === true;
     return `
       <div class="hdr">
         <span>
@@ -847,6 +850,7 @@
           <span class="pid">#${id}</span>
           ${statusTag}
           ${hasError ? '<span class="tag stale">error</span>' : ''}
+          ${deployPending ? '<span class="tag" style="border-color:var(--accent);color:var(--accent)">⏳ deploy pending</span>' : ''}
         </span>
         <span class="tag">auto-execute</span>
       </div>
