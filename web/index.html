@@ -172,6 +172,26 @@
     font-size: 0.95rem;
     color: var(--accent);
   }
+  .perf-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 0.7rem;
+    font-size: 0.82rem;
+  }
+  .perf-table th,
+  .perf-table td {
+    text-align: left;
+    padding: 0.35rem 0.45rem;
+    border-top: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+  }
+  .perf-table th {
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .perf-table .current {
+    color: var(--accent);
+  }
 
   /* Console modal */
   .modal-backdrop {
@@ -631,6 +651,36 @@
     `;
   }
 
+  function renderStrategyPerfTable(rows, title = "Strategy APR") {
+    if (!rows || !rows.length) return "";
+    const body = rows.map(row => `
+      <tr>
+        <td class="${row.is_current ? "current" : ""}">${esc(row.strategy)}${row.is_current ? " *" : ""}</td>
+        <td>${fmtPct(row.apr_pct)}</td>
+        <td>${fmtMoney(row.pnl_usd)}</td>
+        <td>${row.tracked_days != null ? Number(row.tracked_days).toFixed(1) + " d" : "—"}</td>
+        <td>${row.sessions ?? "—"}</td>
+      </tr>
+    `).join("");
+    return `
+      <div class="card summary-card">
+        <h2>${esc(title)}</h2>
+        <table class="perf-table">
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>APR</th>
+              <th>PnL</th>
+              <th>Days</th>
+              <th>Sessions</th>
+            </tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
   // --- Renderers ---
   function runningCard(id, payload, pos = null) {
     const st = payload.state || {};
@@ -639,6 +689,7 @@
       ? st.price_history[st.price_history.length - 1].p
       : null;
     const perf = calcPerformance(payload, pos);
+    const strategyPerf = payload.strategy_performance || [];
     const logAge = payload.log_last_modified
       ? (Date.now() / 1000) - payload.log_last_modified
       : null;
@@ -684,6 +735,27 @@
         <button class="danger" data-action="stop" data-id="${id}">stop</button>
       </div>
       <div class="perf-note">Track: ${perf.trackedDays > 0 ? perf.trackedDays.toFixed(1) + " d" : "—"} · fees ${fmtMoney(payload.performance ? payload.performance.fees_usd : null)} · IL ${fmtMoney(payload.performance ? -Math.abs(payload.performance.il_usd || 0) : null)}</div>
+      ${strategyPerf.length ? `
+      <table class="perf-table">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>APR</th>
+            <th>PnL</th>
+            <th>Days</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${strategyPerf.slice(0, 4).map(row => `
+            <tr>
+              <td class="${row.is_current ? "current" : ""}">${esc(row.strategy)}${row.is_current ? " *" : ""}</td>
+              <td>${fmtPct(row.apr_pct)}</td>
+              <td>${fmtMoney(row.pnl_usd)}</td>
+              <td>${Number(row.tracked_days || 0).toFixed(1)} d</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>` : ""}
       <div class="err" id="err-${id}"></div>
     `;
   }
@@ -879,7 +951,47 @@
         summaryStats.aprPct = trackedDays > 0
           ? summaryStats.gainPct * (365 / trackedDays)
           : null;
-        walletSummary.innerHTML = renderWalletSummary(summaryStats);
+        const strategyAgg = new Map();
+        for (const p of active) {
+          if (!botsSet.has(p.id)) continue;
+          const payload = payloadById.get(p.id);
+          if (!payload) continue;
+          for (const row of (payload.strategy_performance || [])) {
+            const cur = strategyAgg.get(row.strategy) || {
+              strategy: row.strategy,
+              fees_usd: 0,
+              il_usd: 0,
+              pnl_usd: 0,
+              tracked_seconds: 0,
+              capital_seconds: 0,
+              sessions: 0,
+              is_current: false,
+            };
+            cur.fees_usd += Number(row.fees_usd || 0);
+            cur.il_usd += Number(row.il_usd || 0);
+            cur.pnl_usd += Number(row.pnl_usd || 0);
+            cur.tracked_seconds += Number(row.tracked_days || 0) * 86400;
+            cur.sessions += Number(row.sessions || 0);
+            cur.capital_seconds += Number(row.capital_seconds || 0);
+            cur.is_current = cur.is_current || !!row.is_current;
+            strategyAgg.set(row.strategy, cur);
+          }
+        }
+        const strategyRows = [...strategyAgg.values()].map(row => {
+          const aprPct = row.capital_seconds > 0
+            ? ((row.pnl_usd * 365 * 86400) / row.capital_seconds) * 100
+            : null;
+          return {
+            strategy: row.strategy,
+            pnl_usd: row.pnl_usd,
+            tracked_days: row.tracked_seconds / 86400,
+            sessions: row.sessions,
+            apr_pct: aprPct,
+            is_current: row.is_current,
+          };
+        }).sort((a, b) => (b.apr_pct ?? -Infinity) - (a.apr_pct ?? -Infinity));
+
+        walletSummary.innerHTML = renderWalletSummary(summaryStats) + renderStrategyPerfTable(strategyRows, "APR real por estrategia");
         walletSummary.style.display = "";
       } else {
         walletSummary.style.display = "none";

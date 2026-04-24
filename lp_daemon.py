@@ -205,6 +205,9 @@ class State:
             "range_lo": 0, "range_hi": 0,
             "pool_active": True, "hold_asset": None,
             "tracking_started_at": 0,
+            "position_liquidity": 0,
+            "position_tick_lower": 0,
+            "position_tick_upper": 0,
             "last_action_time": 0,
             "last_action_by_type": {},  # {action_type: unix_ts}
             "actions_today": 0, "actions_today_date": "",
@@ -646,6 +649,9 @@ def daemon_loop(args):
                         log(f"Position updated: ${pos['lo']:.0f}-${pos['hi']:.0f}")
                     state.set("range_lo", pos["lo"])
                     state.set("range_hi", pos["hi"])
+                    state.data["position_liquidity"] = pos["liq"]
+                    state.data["position_tick_lower"] = pos["tl"]
+                    state.data["position_tick_upper"] = pos["tu"]
                     state.data["last_position_fetch_ts"] = time.time()
                     state.save()
 

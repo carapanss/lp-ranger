@@ -15,6 +15,7 @@ Design constraints:
 """
 import json
 import hmac
+import math
 import re
 import socket
 import subprocess
@@ -66,6 +67,7 @@ POSITIONS_CACHE_TTL = 60
 _positions_cache: dict[str, tuple[float, list]] = {}
 
 _start_time = time.time()
+_strategy_perf_lock = threading.Lock()
 
 
 # --- Bot state (local filesystem) ---
@@ -175,6 +177,10 @@ def _bot_strategy_name_file(bot_id: str) -> Path:
     return BOTS_DIR / bot_id / "strategy_name"
 
 
+def _bot_strategy_perf_file(bot_id: str) -> Path:
+    return BOTS_DIR / bot_id / ".local" / "share" / "lp-ranger" / "strategy_performance.json"
+
+
 def _match_strategy_name(content: dict) -> str | None:
     """Resolve a bot strategy JSON to one of the UI's canonical strategy names."""
     if not isinstance(content, dict):
@@ -250,6 +256,179 @@ def performance_summary(state: dict | None, state_file: Path) -> dict | None:
     return summary
 
 
+def _state_position_value_usd(state: dict | None) -> float | None:
+    if not isinstance(state, dict):
+        return None
+    liq = int(state.get("position_liquidity", 0) or 0)
+    tick_lo = state.get("position_tick_lower")
+    tick_hi = state.get("position_tick_upper")
+    history = state.get("price_history") or []
+    if not liq or tick_lo is None or tick_hi is None or not history:
+        return None
+    try:
+        price = float(history[-1]["p"])
+        tick_lo = int(tick_lo)
+        tick_hi = int(tick_hi)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    if tick_lo > tick_hi:
+        tick_lo, tick_hi = tick_hi, tick_lo
+    raw = price / 1e12
+    sqrt_p = math.sqrt(raw)
+    sqrt_a = 1.0001 ** (tick_lo / 2)
+    sqrt_b = 1.0001 ** (tick_hi / 2)
+    liquidity = float(liq)
+    if sqrt_p <= sqrt_a:
+        amount0 = liquidity * (sqrt_b - sqrt_a) / (sqrt_a * sqrt_b)
+        amount1 = 0.0
+    elif sqrt_p >= sqrt_b:
+        amount0 = 0.0
+        amount1 = liquidity * (sqrt_b - sqrt_a)
+    else:
+        amount0 = liquidity * (sqrt_b - sqrt_p) / (sqrt_p * sqrt_b)
+        amount1 = liquidity * (sqrt_p - sqrt_a)
+    weth = amount0 / 1e18
+    usdc = amount1 / 1e6
+    return weth * price + usdc
+
+
+def _load_strategy_performance(bot_id: str) -> dict:
+    path = _bot_strategy_perf_file(bot_id)
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("entries", {})
+    data.setdefault("current", None)
+    return data
+
+
+def _save_strategy_performance(bot_id: str, data: dict) -> None:
+    path = _bot_strategy_perf_file(bot_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+
+
+def _ensure_strategy_entry(entries: dict, strategy: str) -> dict:
+    entry = entries.get(strategy)
+    if not isinstance(entry, dict):
+        entry = {}
+        entries[strategy] = entry
+    entry.setdefault("fees_usd", 0.0)
+    entry.setdefault("il_usd", 0.0)
+    entry.setdefault("tracked_seconds", 0.0)
+    entry.setdefault("capital_seconds", 0.0)
+    entry.setdefault("sessions", 0)
+    entry.setdefault("last_capital_usd", None)
+    return entry
+
+
+def _finalize_strategy_snapshot(data: dict, state: dict | None, now: float) -> None:
+    current = data.get("current")
+    if not isinstance(current, dict):
+        return
+    strategy = current.get("strategy")
+    if not strategy or not isinstance(state, dict):
+        return
+    entry = _ensure_strategy_entry(data["entries"], strategy)
+    last_update_at = float(current.get("last_update_at", now) or now)
+    dt = max(0.0, now - last_update_at)
+    fees_now = float(state.get("total_fees", 0) or 0)
+    il_now = float(state.get("total_il", 0) or 0)
+    prev_fees = float(current.get("last_fees_usd", fees_now) or fees_now)
+    prev_il = float(current.get("last_il_usd", il_now) or il_now)
+    fees_delta = fees_now - prev_fees
+    il_delta = il_now - prev_il
+    capital_usd = _state_position_value_usd(state)
+    if capital_usd is None:
+        capital_usd = current.get("last_capital_usd")
+    if dt > 0:
+        entry["tracked_seconds"] += dt
+        if capital_usd and capital_usd > 0:
+            entry["capital_seconds"] += float(capital_usd) * dt
+            entry["last_capital_usd"] = round(float(capital_usd), 2)
+    if fees_delta >= 0:
+        entry["fees_usd"] += fees_delta
+    else:
+        current["session_reset"] = True
+    if il_delta >= 0:
+        entry["il_usd"] += il_delta
+    else:
+        current["session_reset"] = True
+    current["last_update_at"] = now
+    current["last_fees_usd"] = fees_now
+    current["last_il_usd"] = il_now
+    current["last_capital_usd"] = capital_usd
+
+
+def _activate_strategy(data: dict, strategy: str, state: dict | None, now: float) -> None:
+    entry = _ensure_strategy_entry(data["entries"], strategy)
+    entry["sessions"] += 1
+    fees_now = float((state or {}).get("total_fees", 0) or 0)
+    il_now = float((state or {}).get("total_il", 0) or 0)
+    capital_usd = _state_position_value_usd(state)
+    data["current"] = {
+        "strategy": strategy,
+        "started_at": now,
+        "last_update_at": now,
+        "last_fees_usd": fees_now,
+        "last_il_usd": il_now,
+        "last_capital_usd": capital_usd,
+    }
+
+
+def update_strategy_performance(bot_id: str, state: dict | None, strategy_name: str | None) -> list[dict]:
+    with _strategy_perf_lock:
+        data = _load_strategy_performance(bot_id)
+        now = time.time()
+        current = data.get("current")
+        if isinstance(current, dict):
+            _finalize_strategy_snapshot(data, state, now)
+        if strategy_name:
+            current = data.get("current")
+            if not isinstance(current, dict) or current.get("strategy") != strategy_name:
+                _activate_strategy(data, strategy_name, state, now)
+        _save_strategy_performance(bot_id, data)
+
+        rows: list[dict] = []
+        for strategy, entry in sorted(data["entries"].items()):
+            fees = float(entry.get("fees_usd", 0) or 0)
+            il = float(entry.get("il_usd", 0) or 0)
+            tracked_seconds = float(entry.get("tracked_seconds", 0) or 0)
+            capital_seconds = float(entry.get("capital_seconds", 0) or 0)
+            apr_pct = None
+            if capital_seconds > 0 and tracked_seconds > 0:
+                apr_pct = ((fees - il) * 365 * 86400 / capital_seconds) * 100
+            rows.append({
+                "strategy": strategy,
+                "fees_usd": round(fees, 2),
+                "il_usd": round(il, 2),
+                "pnl_usd": round(fees - il, 2),
+                "tracked_days": round(tracked_seconds / 86400, 2) if tracked_seconds > 0 else 0,
+                "capital_seconds": round(capital_seconds, 2),
+                "sessions": int(entry.get("sessions", 0) or 0),
+                "last_capital_usd": entry.get("last_capital_usd"),
+                "apr_pct": round(apr_pct, 2) if apr_pct is not None else None,
+                "is_current": bool(isinstance(data.get("current"), dict) and data["current"].get("strategy") == strategy),
+            })
+        rows.sort(key=lambda row: (row["apr_pct"] is None, -(row["apr_pct"] or 0), -(row["pnl_usd"] or 0)))
+        return rows
+
+
+def close_strategy_performance_session(bot_id: str, state: dict | None) -> None:
+    with _strategy_perf_lock:
+        data = _load_strategy_performance(bot_id)
+        if isinstance(data.get("current"), dict):
+            _finalize_strategy_snapshot(data, state, time.time())
+            data["current"] = None
+            _save_strategy_performance(bot_id, data)
+
+
 def diagnostics_text(bot_id: str) -> str:
     payload = read_state(bot_id)
     state = payload.get("state") or {}
@@ -318,18 +497,32 @@ def read_state(bot_id: str) -> dict:
         and int(ack.get("count", -1)) == latest_error["count"]
     )
 
+    strategy_name = bot_strategy_name(bot_id)
+    strategy_performance = update_strategy_performance(bot_id, state, strategy_name)
+
     return {
         "position_id": bot_id,
         "state": state,
         "log_tail": log_tail,
         "log_last_modified": log_mtime,
         "stale": stale,
-        "strategy_name": bot_strategy_name(bot_id),
+        "strategy_name": strategy_name,
         "performance": performance_summary(state, state_file),
+        "strategy_performance": strategy_performance,
         "latest_error": latest_error,
         "error_acknowledged": error_acknowledged,
         "has_unseen_error": bool(latest_error and not error_acknowledged),
     }
+
+
+def _read_bot_state_file(bot_id: str) -> dict | None:
+    state_file = BOTS_DIR / bot_id / ".local" / "share" / "lp-ranger" / "daemon_state.json"
+    try:
+        with state_file.open() as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return state if isinstance(state, dict) else None
 
 
 # --- Base RPC: raw JSON-RPC, no web3 import (keeps RSS low) ---
@@ -965,8 +1158,11 @@ class Handler(BaseHTTPRequestHandler):
             if strategy not in valid_names:
                 self._send_json(400, {"ok": False, "error": f"unknown strategy {strategy!r}"})
                 return
+            state = _read_bot_state_file(bot_id)
             try:
+                close_strategy_performance_session(bot_id, state)
                 seed_bot_dir(bot_id, strategy)
+                update_strategy_performance(bot_id, state, strategy)
             except Exception as e:  # noqa: BLE001
                 self._send_json(500, {"ok": False, "error": f"seed: {e}"})
                 return
@@ -988,8 +1184,13 @@ class Handler(BaseHTTPRequestHandler):
             if strategy not in valid_names:
                 self._send_json(400, {"ok": False, "error": f"unknown strategy {strategy!r}"})
                 return
+            state = _read_bot_state_file(bot_id)
+            previous_strategy = bot_strategy_name(bot_id)
             try:
+                if previous_strategy:
+                    update_strategy_performance(bot_id, state, previous_strategy)
                 seed_bot_dir(bot_id, strategy)
+                update_strategy_performance(bot_id, state, strategy)
             except Exception as e:  # noqa: BLE001
                 self._send_json(500, {"ok": False, "error": f"seed: {e}"})
                 return
@@ -1005,6 +1206,8 @@ class Handler(BaseHTTPRequestHandler):
             if not bot_id.isdigit():
                 self._send_json(400, {"ok": False, "error": "invalid bot id"})
                 return
+            state = _read_bot_state_file(bot_id)
+            close_strategy_performance_session(bot_id, state)
             ok, msg = _systemctl("disable-now", bot_id)
             if ok:
                 self._send_json(200, {"ok": True, "message": msg or "stopped"})
