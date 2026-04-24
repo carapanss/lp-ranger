@@ -204,6 +204,7 @@ class State:
             "position_id": "",
             "range_lo": 0, "range_hi": 0,
             "pool_active": True, "hold_asset": None,
+            "tracking_started_at": 0,
             "last_action_time": 0,
             "last_action_by_type": {},  # {action_type: unix_ts}
             "actions_today": 0, "actions_today_date": "",
@@ -211,6 +212,7 @@ class State:
             "price_history": [],
         }
         self._load()
+        self._ensure_tracking_metadata()
 
     def _load(self):
         if STATE_FILE.exists():
@@ -218,6 +220,16 @@ class State:
                 with open(STATE_FILE) as f:
                     self.data.update(json.load(f))
             except: pass
+
+    def _ensure_tracking_metadata(self):
+        if self.data.get("tracking_started_at"):
+            return
+        try:
+            started = STATE_FILE.stat().st_mtime if STATE_FILE.exists() else 0
+        except OSError:
+            started = 0
+        self.data["tracking_started_at"] = started or time.time()
+        self.save()
 
     def save(self):
         with open(STATE_FILE, "w") as f:

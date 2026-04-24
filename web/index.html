@@ -159,6 +159,19 @@
   .card button.ghost { color: var(--muted); }
   .card button.ghost:hover { color: var(--fg); }
   .card .err { color: var(--bad); font-size: 0.8rem; margin-top: 0.3rem; word-break: break-word; }
+  .perf-note {
+    margin-top: 0.45rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .summary-card {
+    margin-bottom: 1rem;
+  }
+  .summary-card h2 {
+    margin: 0 0 0.6rem 0;
+    font-size: 0.95rem;
+    color: var(--accent);
+  }
 
   /* Console modal */
   .modal-backdrop {
@@ -506,6 +519,18 @@
     return "$" + Math.round(n).toLocaleString();
   }
 
+  function fmtMoney(n) {
+    if (n == null) return "—";
+    const sign = n > 0 ? "+" : "";
+    return sign + "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function fmtPct(n) {
+    if (n == null || !Number.isFinite(n)) return "—";
+    const sign = n > 0 ? "+" : "";
+    return sign + n.toFixed(2) + "%";
+  }
+
   function fmtFee(fee) {
     if (fee == null) return "—";
     return (fee / 10000).toString() + "%";
@@ -547,13 +572,73 @@
     }).join("\n");
   }
 
+  function positionValueUsd(liquidity, tickLo, tickHi, priceUsdcPerEth) {
+    const liq = Number(liquidity || 0);
+    const lo = Number(tickLo);
+    const hi = Number(tickHi);
+    const price = Number(priceUsdcPerEth || 0);
+    if (!(liq > 0) || !Number.isFinite(lo) || !Number.isFinite(hi) || !(price > 0)) return null;
+    const tickLower = Math.min(lo, hi);
+    const tickUpper = Math.max(lo, hi);
+    const raw = price / 1e12;
+    const sqrtP = Math.sqrt(raw);
+    const sqrtA = Math.pow(1.0001, tickLower / 2);
+    const sqrtB = Math.pow(1.0001, tickUpper / 2);
+    let amount0 = 0;
+    let amount1 = 0;
+    if (sqrtP <= sqrtA) {
+      amount0 = liq * (sqrtB - sqrtA) / (sqrtA * sqrtB);
+    } else if (sqrtP >= sqrtB) {
+      amount1 = liq * (sqrtB - sqrtA);
+    } else {
+      amount0 = liq * (sqrtB - sqrtP) / (sqrtP * sqrtB);
+      amount1 = liq * (sqrtP - sqrtA);
+    }
+    const weth = amount0 / 1e18;
+    const usdc = amount1 / 1e6;
+    return weth * price + usdc;
+  }
+
+  function calcPerformance(payload, pos) {
+    const perf = payload.performance || {};
+    const pnlUsd = Number(perf.pnl_usd ?? 0);
+    const trackedDays = Number(perf.tracked_days ?? 0);
+    const st = payload.state || {};
+    const lastPrice = st.price_history && st.price_history.length
+      ? st.price_history[st.price_history.length - 1].p
+      : null;
+    const capitalUsd = pos
+      ? positionValueUsd(pos.liquidity, pos.tick_lower, pos.tick_upper, lastPrice)
+      : null;
+    const gainPct = capitalUsd > 0 ? (pnlUsd / capitalUsd) * 100 : null;
+    const aprPct = gainPct != null && trackedDays > 0 ? gainPct * (365 / trackedDays) : null;
+    return { pnlUsd, trackedDays, capitalUsd, gainPct, aprPct };
+  }
+
+  function renderWalletSummary(summary) {
+    return `
+      <div class="card summary-card">
+        <h2>Tracked APR</h2>
+        <dl>
+          <dt>Bots tracked</dt><dd>${summary.bots}</dd>
+          <dt>Capital now</dt><dd>${fmtUSD(summary.capitalUsd)}</dd>
+          <dt>PnL</dt><dd>${fmtMoney(summary.pnlUsd)}</dd>
+          <dt>Gain</dt><dd>${fmtPct(summary.gainPct)}</dd>
+          <dt>APR now</dt><dd>${fmtPct(summary.aprPct)}</dd>
+        </dl>
+        <div class="perf-note">APR simple anualizado sobre el rendimiento realizado y el capital actual estimado de la pool.</div>
+      </div>
+    `;
+  }
+
   // --- Renderers ---
-  function runningCard(id, payload) {
+  function runningCard(id, payload, pos = null) {
     const st = payload.state || {};
     const strategyName = payload.strategy_name || "exit_pool";
     const lastPrice = st.price_history && st.price_history.length
       ? st.price_history[st.price_history.length - 1].p
       : null;
+    const perf = calcPerformance(payload, pos);
     const logAge = payload.log_last_modified
       ? (Date.now() / 1000) - payload.log_last_modified
       : null;
@@ -585,6 +670,9 @@
         <dt>Cooldown</dt><dd>${fmtDur(cooldownRemaining(st.last_action_time))}</dd>
         <dt>Pool</dt><dd>${esc(poolText)}</dd>
         <dt>Strategy</dt><dd>${esc(strategyName)}</dd>
+        <dt>PnL</dt><dd>${fmtMoney(perf.pnlUsd)}</dd>
+        <dt>Gain</dt><dd>${fmtPct(perf.gainPct)}</dd>
+        <dt>APR now</dt><dd>${fmtPct(perf.aprPct)}</dd>
         <dt>Actions today</dt><dd>${st.actions_today || 0} / 3</dd>
       </dl>
       <pre class="mini-log">${renderLog(miniLines)}</pre>
@@ -595,6 +683,7 @@
         ${ackButton}
         <button class="danger" data-action="stop" data-id="${id}">stop</button>
       </div>
+      <div class="perf-note">Track: ${perf.trackedDays > 0 ? perf.trackedDays.toFixed(1) + " d" : "—"} · fees ${fmtMoney(payload.performance ? payload.performance.fees_usd : null)} · IL ${fmtMoney(payload.performance ? -Math.abs(payload.performance.il_usd || 0) : null)}</div>
       <div class="err" id="err-${id}"></div>
     `;
   }
@@ -699,8 +788,9 @@
     }
 
     // Build layout: positions section (if any) + orphan bots section (if any).
-    if (!MAIN.querySelector("#positions-section") || !MAIN.querySelector("#bots-section")) {
+    if (!MAIN.querySelector("#wallet-summary") || !MAIN.querySelector("#positions-section") || !MAIN.querySelector("#bots-section")) {
       MAIN.innerHTML = `
+        <div id="wallet-summary" style="display:none"></div>
         <div id="positions-section" style="display:none">
           <div class="section-label">Your positions</div>
           <div class="grid" id="positions-grid"></div>
@@ -716,6 +806,7 @@
     }
 
     const posSection = MAIN.querySelector("#positions-section");
+    const walletSummary = MAIN.querySelector("#wallet-summary");
     const botsSection = MAIN.querySelector("#bots-section");
     const posGrid = MAIN.querySelector("#positions-grid");
     const emptyDetails = MAIN.querySelector("#empty-details");
@@ -726,6 +817,7 @@
     // --- Positions section: split into active (has liquidity OR running) vs empty ---
     if (positions.length) {
       posSection.style.display = "";
+      const payloadById = new Map();
 
       const active = positions.filter(p => p.has_liquidity || botsSet.has(p.id));
       const empty = positions.filter(p => !p.has_liquidity && !botsSet.has(p.id));
@@ -738,7 +830,8 @@
           if (botsSet.has(p.id)) {
             try {
               const payload = await api("/api/state/" + encodeURIComponent(p.id));
-              inner = runningCard(p.id, payload);
+              payloadById.set(p.id, payload);
+              inner = runningCard(p.id, payload, p);
             } catch {
               inner = runningCard(p.id, { position_id: p.id, state: null, log_tail: [], stale: true });
             }
@@ -756,6 +849,43 @@
       await renderTo(active, posGrid);
       await renderTo(empty, emptyGrid);
 
+      const summaryStats = active.reduce((acc, p) => {
+        if (!botsSet.has(p.id)) return acc;
+        const payload = payloadById.get(p.id);
+        if (!payload) return acc;
+        const perf = calcPerformance(payload, p);
+        if (!(perf.capitalUsd > 0)) return acc;
+        acc.bots += 1;
+        acc.capitalUsd += perf.capitalUsd;
+        acc.pnlUsd += perf.pnlUsd;
+        return acc;
+      }, { bots: 0, capitalUsd: 0, pnlUsd: 0 });
+
+      if (summaryStats.bots > 0 && summaryStats.capitalUsd > 0) {
+        summaryStats.gainPct = (summaryStats.pnlUsd / summaryStats.capitalUsd) * 100;
+        const daysWeighted = active.reduce((acc, p) => {
+          if (!botsSet.has(p.id)) return acc;
+          const payload = payloadById.get(p.id);
+          if (!payload) return acc;
+          const perf = calcPerformance(payload, p);
+          if (!(perf.capitalUsd > 0) || !(perf.trackedDays > 0)) return acc;
+          acc.weightedDays += perf.trackedDays * perf.capitalUsd;
+          acc.capitalUsd += perf.capitalUsd;
+          return acc;
+        }, { weightedDays: 0, capitalUsd: 0 });
+        const trackedDays = daysWeighted.capitalUsd > 0
+          ? daysWeighted.weightedDays / daysWeighted.capitalUsd
+          : 0;
+        summaryStats.aprPct = trackedDays > 0
+          ? summaryStats.gainPct * (365 / trackedDays)
+          : null;
+        walletSummary.innerHTML = renderWalletSummary(summaryStats);
+        walletSummary.style.display = "";
+      } else {
+        walletSummary.style.display = "none";
+        walletSummary.innerHTML = "";
+      }
+
       if (empty.length) {
         emptyDetails.style.display = "";
         emptySummary.textContent = `${empty.length} empty position${empty.length === 1 ? "" : "s"} (no liquidity)`;
@@ -763,6 +893,8 @@
         emptyDetails.style.display = "none";
       }
     } else {
+      walletSummary.style.display = "none";
+      walletSummary.innerHTML = "";
       posSection.style.display = "none";
       posGrid.innerHTML = "";
       emptyGrid.innerHTML = "";

@@ -220,6 +220,36 @@ def bot_strategy_name(bot_id: str) -> str | None:
     return _match_strategy_name(content)
 
 
+def _tracking_days(state: dict | None, state_file: Path) -> float | None:
+    if not isinstance(state, dict):
+        return None
+    started = state.get("tracking_started_at")
+    if not started:
+        try:
+            started = state_file.stat().st_mtime if state_file.exists() else 0
+        except OSError:
+            started = 0
+    if not started:
+        return None
+    return max(1 / 24, (time.time() - float(started)) / 86400)
+
+
+def performance_summary(state: dict | None, state_file: Path) -> dict | None:
+    if not isinstance(state, dict):
+        return None
+    fees = float(state.get("total_fees", 0) or 0)
+    il = float(state.get("total_il", 0) or 0)
+    tracked_days = _tracking_days(state, state_file)
+    summary = {
+        "fees_usd": round(fees, 2),
+        "il_usd": round(il, 2),
+        "pnl_usd": round(fees - il, 2),
+        "tracked_days": round(tracked_days, 2) if tracked_days is not None else None,
+        "tracking_started_at": state.get("tracking_started_at") or None,
+    }
+    return summary
+
+
 def diagnostics_text(bot_id: str) -> str:
     payload = read_state(bot_id)
     state = payload.get("state") or {}
@@ -295,6 +325,7 @@ def read_state(bot_id: str) -> dict:
         "log_last_modified": log_mtime,
         "stale": stale,
         "strategy_name": bot_strategy_name(bot_id),
+        "performance": performance_summary(state, state_file),
         "latest_error": latest_error,
         "error_acknowledged": error_acknowledged,
         "has_unseen_error": bool(latest_error and not error_acknowledged),
@@ -443,6 +474,8 @@ def positions_for_wallet(wallet: str) -> list[dict]:
             "id": str(token_id),
             "fee": fee,
             "liquidity": str(liquidity),
+            "tick_lower": tick_lower,
+            "tick_upper": tick_upper,
             "lo": round(pl, 2),
             "hi": round(pu, 2),
             "has_liquidity": liquidity > 0,
