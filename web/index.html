@@ -864,6 +864,8 @@
   // --- Renderers ---
   function runningCard(id, payload, pos = null) {
     const st = payload.state || {};
+    const liveId = payload.live_position_id && payload.live_position_id !== id ? payload.live_position_id : null;
+    const effectiveId = payload.effective_bot_id || liveId || id;
     const strategyName = payload.strategy_name || "exit_pool";
     const lastPrice = st.price_history && st.price_history.length
       ? st.price_history[st.price_history.length - 1].p
@@ -912,6 +914,7 @@
         <span>
           <span class="emoji">${lastEmoji(payload.log_tail)}</span>
           <span class="pid">#${id}</span>
+          ${liveId ? `<span class="tag" style="border-color:var(--warn);color:var(--warn)">live nft #${esc(liveId)}</span>` : ""}
           ${statusTag}
           ${hasError ? '<span class="tag stale">error</span>' : ''}
           ${deployPending ? '<span class="tag" style="border-color:var(--accent);color:var(--accent)">⏳ deploy pending</span>' : ''}
@@ -921,7 +924,7 @@
       <dl>
         <dt>ETH</dt><dd>${fmtUSD(lastPrice)}</dd>
         <dt>Range</dt><dd>${fmtUSD(st.range_lo)} – ${fmtUSD(st.range_hi)}</dd>
-        <dt>Capital pool</dt><dd>${capitalLabel} <button class="ghost" data-action="deploy-capital" data-id="${id}" style="font-size:0.72rem;padding:0.15rem 0.45rem;margin-left:0.3rem" title="Rebalancear ahora con todo el capital disponible (ignora cooldown)">deploy</button></dd>
+        <dt>Capital pool</dt><dd>${capitalLabel} <button class="ghost" data-action="deploy-capital" data-id="${effectiveId}" style="font-size:0.72rem;padding:0.15rem 0.45rem;margin-left:0.3rem" title="Rebalancear ahora con todo el capital disponible (ignora cooldown)">deploy</button></dd>
         <dt>Cooldown</dt><dd>${fmtDur(cooldownRemaining(st.last_action_time))}</dd>
         <dt>Pool</dt><dd>${esc(poolText)}</dd>
         <dt>Strategy</dt><dd>${esc(strategyName)}</dd>
@@ -935,7 +938,7 @@
       <div class="actions">
         <select data-strategy="${id}">${stratOpts}</select>
         <button class="ghost" data-action="set-strategy" data-id="${id}">apply strategy</button>
-        <button class="ghost" data-action="set-capital" data-id="${id}" data-target-usd="${targetUsd ?? ""}" title="Capital máximo en la pool">capital</button>
+        <button class="ghost" data-action="set-capital" data-id="${effectiveId}" data-target-usd="${targetUsd ?? ""}" title="Capital máximo en la pool">capital</button>
         <button data-action="console" data-id="${id}">full log</button>
         ${ackButton}
         <button class="danger" data-action="stop" data-id="${id}">stop</button>

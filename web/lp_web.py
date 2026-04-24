@@ -196,6 +196,34 @@ def write_bot_config(bot_id: str, config: dict) -> tuple[bool, str]:
         return False, f"write failed: {e}"
 
 
+def _promote_live_bot_id(bot_id: str, live_position_id: str | None) -> str:
+    """Move sidecar files to the daemon's live NFT id when it changes."""
+    if not live_position_id or live_position_id == bot_id or not live_position_id.isdigit():
+        return bot_id
+
+    src_dir = BOTS_DIR / bot_id
+    dst_dir = BOTS_DIR / live_position_id
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return bot_id
+
+    moves = [
+        (src_dir / "strategy_name", dst_dir / "strategy_name"),
+        (src_dir / ".local" / "share" / "lp-ranger" / "bot_config.json", dst_dir / ".local" / "share" / "lp-ranger" / "bot_config.json"),
+        (src_dir / ".local" / "share" / "lp-ranger" / "strategy_performance.json", dst_dir / ".local" / "share" / "lp-ranger" / "strategy_performance.json"),
+    ]
+    for src, dst in moves:
+        if not src.exists():
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+        except OSError:
+            pass
+    return live_position_id
+
+
 def _bot_strategy_name_file(bot_id: str) -> Path:
     return BOTS_DIR / bot_id / "strategy_name"
 
@@ -625,11 +653,19 @@ def read_state(bot_id: str) -> dict:
         and int(ack.get("count", -1)) == latest_error["count"]
     )
 
-    strategy_name = bot_strategy_name(bot_id)
+    effective_bot_id = _promote_live_bot_id(bot_id, live_position_id)
+    strategy_name = bot_strategy_name(effective_bot_id)
     strategy_performance = update_strategy_performance(bot_id, state, strategy_name)
+
+    live_position_id = None
+    if isinstance(state, dict):
+        pid = state.get("position_id")
+        if pid is not None and str(pid).isdigit():
+            live_position_id = str(pid)
 
     return {
         "position_id": bot_id,
+        "live_position_id": live_position_id,
         "state": state,
         "log_tail": log_tail,
         "log_last_modified": log_mtime,
@@ -637,6 +673,7 @@ def read_state(bot_id: str) -> dict:
         "strategy_name": strategy_name,
         "performance": performance_summary(state, state_file),
         "strategy_performance": strategy_performance,
+        "effective_bot_id": effective_bot_id,
         "latest_error": latest_error,
         "error_acknowledged": error_acknowledged,
         "has_unseen_error": bool(latest_error and not error_acknowledged),
