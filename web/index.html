@@ -503,6 +503,23 @@
   let consoleTimer = null;
   const LOG_FOLLOW_THRESHOLD = 24;
 
+  // Persistent per-bot messages that survive card re-renders (cleared after TTL).
+  const _botMsg = new Map(); // id → { text, color, expires }
+  function setBotMsg(id, text, color = "var(--good)", ttl = 20000) {
+    _botMsg.set(String(id), { text, color, expires: Date.now() + ttl });
+    _applyBotMsg(String(id));
+  }
+  function _applyBotMsg(id) {
+    const m = _botMsg.get(id);
+    if (!m) return;
+    if (Date.now() > m.expires) { _botMsg.delete(id); return; }
+    const el = document.getElementById("err-" + id);
+    if (el) { el.style.color = m.color; el.textContent = m.text; }
+  }
+  function applyAllBotMsgs() {
+    for (const id of [..._botMsg.keys()]) _applyBotMsg(id);
+  }
+
   // --- Persistence ---
   const savedWallet = localStorage.getItem("lp.wallet") || "";
   WALLET_INPUT.value = savedWallet;
@@ -567,23 +584,24 @@
   }
 
   // SVG mini-chart showing RAM history against Pi Zero 2W total (512 MB).
-  // Labels are overlaid inside the chart so the plot starts flush left.
-  function ramChartSvg(history, currentKb) {
+  // Rendered inside the dl with grid-column:1/-1 so it spans full card width.
+  // Labels placed BELOW each reference line (never clipped by viewBox).
+  function ramChartSvg(history) {
     if (!history || history.length < 2) return "";
     const vals = history.map(h => h.kb);
     const TOTAL_KB = 512 * 1024;
     const WARN_KB  = 200 * 1024;
     const CRIT_KB  = 400 * 1024;
     const maxVal = Math.max(...vals);
-    const W = 300, H = 70;
-    const padL = 2, padR = 2, padT = 8, padB = 2;
+    const W = 300, H = 90;
+    const padL = 2, padR = 2, padT = 4, padB = 14;  // padB leaves room for "0" label
     const iW = W - padL - padR, iH = H - padT - padB;
 
     const sy = v => (padT + iH - (v / TOTAL_KB) * iH).toFixed(1);
     const sx = i => (padL + (i / (vals.length - 1)) * iW).toFixed(1);
 
     const line = vals.map((v, i) => `${sx(i)},${sy(v)}`).join(" ");
-    const area = `${padL},${H - padB} ` + line + ` ${sx(vals.length - 1)},${H - padB}`;
+    const area = `${padL},${padT + iH} ` + line + ` ${sx(vals.length - 1)},${padT + iH}`;
 
     const lineColor = maxVal > CRIT_KB ? "#f85149" : maxVal > WARN_KB ? "#f0883e" : "#3fb950";
     const fillClr   = maxVal > CRIT_KB ? "rgba(248,81,73,.12)" : maxVal > WARN_KB ? "rgba(240,136,62,.12)" : "rgba(63,185,80,.12)";
@@ -592,35 +610,33 @@
     const mX = sx(maxIdx), mY = sy(maxVal);
     const curX = sx(vals.length - 1), curY = sy(vals[vals.length - 1]);
 
-    // Reference lines + labels overlaid inside the plot area
+    // Labels below each reference line so they're never clipped
     const refs = [
       { v: TOTAL_KB, lbl: "512M", clr: "var(--muted)", dashed: false },
-      { v: CRIT_KB,  lbl: "400M", clr: "#f85149",      dashed: true },
-      { v: WARN_KB,  lbl: "200M", clr: "#f0883e",      dashed: true },
+      { v: CRIT_KB,  lbl: "400M", clr: "#f85149",      dashed: true  },
+      { v: WARN_KB,  lbl: "200M", clr: "#f0883e",      dashed: true  },
       { v: 0,        lbl: "0",    clr: "var(--muted)", dashed: false },
     ].map(({ v, lbl, clr, dashed }) => {
-      const y = sy(v);
-      const dashAttr = dashed ? 'stroke-dasharray="3,3"' : '';
-      const opacity = dashed ? '.5' : '.25';
-      return `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="${clr}" stroke-width="${dashed ? '0.8' : '0.4'}" ${dashAttr} opacity="${opacity}"/>
-              <text x="${padL + 3}" y="${(Number(y) - 2).toFixed(1)}" font-size="8" fill="${clr}" opacity=".75">${lbl}</text>`;
+      const y = Number(sy(v));
+      const dash = dashed ? 'stroke-dasharray="3,3"' : '';
+      const lY = v === 0 ? y + 9 : y + 9;  // label always below the line
+      return `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W-padR}" y2="${y.toFixed(1)}" stroke="${clr}" stroke-width="${dashed?'0.8':'0.4'}" ${dash} opacity="${dashed?'.5':'.2'}"/>
+              <text x="${padL+3}" y="${lY.toFixed(1)}" font-size="8" fill="${clr}" opacity=".75">${lbl}</text>`;
     }).join("");
 
     const maxTag = maxVal !== vals[vals.length - 1]
       ? `<circle cx="${mX}" cy="${mY}" r="2.5" fill="${lineColor}" opacity=".85"/>
-         <text x="${Number(mX) > W * 0.6 ? Number(mX) - 4 : Number(mX) + 4}" y="${Math.max(padT + 7, Number(mY) - 3)}" text-anchor="${Number(mX) > W * 0.6 ? 'end' : 'start'}" font-size="8" fill="${lineColor}" opacity=".9">▲${fmtRam(maxVal)}</text>`
+         <text x="${Number(mX)>W*.6?Number(mX)-4:Number(mX)+4}" y="${Math.max(padT+9,Number(mY)-3)}" text-anchor="${Number(mX)>W*.6?'end':'start'}" font-size="8" fill="${lineColor}" opacity=".9">▲${fmtRam(maxVal)}</text>`
       : "";
 
-    return `<div style="margin:0.5rem 0 0.2rem 0">
-      <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block" aria-label="RAM history">
-        <rect width="${W}" height="${H}" fill="var(--bg)" rx="2"/>
-        ${refs}
-        <polygon points="${area}" fill="${fillClr}"/>
-        <polyline points="${line}" fill="none" stroke="${lineColor}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
-        ${maxTag}
-        <circle cx="${curX}" cy="${curY}" r="2.5" fill="${lineColor}"/>
-      </svg>
-    </div>`;
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block" aria-label="RAM history">
+      <rect width="${W}" height="${H}" fill="var(--bg)" rx="2"/>
+      ${refs}
+      <polygon points="${area}" fill="${fillClr}"/>
+      <polyline points="${line}" fill="none" stroke="${lineColor}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+      ${maxTag}
+      <circle cx="${curX}" cy="${curY}" r="2.5" fill="${lineColor}"/>
+    </svg>`;
   }
 
   function isValidWallet(s) {
@@ -845,8 +861,8 @@
         <dt>Gain</dt><dd>${fmtPct(perf.gainPct)}</dd>
         <dt>APR now</dt><dd>${fmtPct(perf.aprPct)}</dd>
         <dt>Actions today</dt><dd>${st.actions_today || 0} / 3</dd>
+        ${(ramKb || ramHist.length >= 2) ? `<div style="grid-column:1/-1;padding-top:0.4rem">${ramSummary}${ramChartSvg(ramHist)}</div>` : ''}
       </dl>
-      ${ramSummary}${ramChartSvg(ramHist, ramKb)}
       <pre class="mini-log">${renderLog(miniLines)}</pre>
       <div class="actions">
         <select data-strategy="${id}">${stratOpts}</select>
@@ -1125,6 +1141,8 @@
       botsSection.style.display = "none";
       botsGrid.innerHTML = "";
     }
+
+    applyAllBotMsgs();
   }
 
   // --- Console modal ---
@@ -1281,14 +1299,14 @@
       return;
     }
     if (action === "deploy-capital") {
-      if (!confirm(`Rebalancear bot #${id} ahora con todo el capital disponible?\n(Ignora cooldown — ejecuta en el próximo ciclo del daemon, ~5 min)`)) return;
+      if (!confirm(`Rebalancear bot #${id} ahora con todo el capital disponible?\n(Ignora cooldown — ejecuta en el próximo ciclo, ~5 min)`)) return;
       btn.disabled = true;
       btn.textContent = "…";
       try {
         await api(`/api/bots/${encodeURIComponent(id)}/deploy-capital`, { method: "POST" });
-        if (errEl) { errEl.style.color = "var(--good)"; errEl.textContent = "Deploy solicitado — el daemon ejecutará en el próximo ciclo"; }
+        setBotMsg(id, "✅ Deploy solicitado — el daemon ejecutará en el próximo ciclo (~5 min)", "var(--good)", 30000);
       } catch (e) {
-        if (errEl) { errEl.style.color = ""; errEl.textContent = e.message || "error"; }
+        setBotMsg(id, "❌ " + (e.message || "error al solicitar deploy"), "var(--bad)", 15000);
       } finally {
         btn.disabled = false;
         btn.textContent = "deploy";
@@ -1321,9 +1339,10 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ target_usd: val }),
         });
+        setBotMsg(id, val ? `✅ Capital limitado a $${Math.round(val)}` : "✅ Capital: todo disponible", "var(--good)");
         await refreshAll();
       } catch (e) {
-        if (errEl) errEl.textContent = e.message || "error al guardar capital";
+        setBotMsg(id, "❌ " + (e.message || "error al guardar capital"), "var(--bad)", 15000);
       } finally {
         btn.disabled = false;
         btn.textContent = "capital";
