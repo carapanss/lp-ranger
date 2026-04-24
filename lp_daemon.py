@@ -92,6 +92,18 @@ def _led_write(path, value):
     except (OSError, PermissionError):
         return False
 
+
+def _read_rss_kb() -> int:
+    """Read current process RSS from /proc/self/status. Returns 0 on any failure."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
+
 class _LedBlinker(threading.Thread):
     """Blinks the Pi ACT LED while ERROR_FLAG_FILE is present.
 
@@ -222,7 +234,10 @@ class State:
             try:
                 with open(STATE_FILE) as f:
                     self.data.update(json.load(f))
-            except: pass
+            except json.JSONDecodeError as e:
+                log(f"State file corrupted, starting fresh: {e}", "WARN")
+            except OSError as e:
+                log(f"State file unreadable, starting fresh: {e}", "WARN")
 
     def _ensure_tracking_metadata(self):
         if self.data.get("tracking_started_at"):
@@ -245,7 +260,7 @@ class State:
         """Check cooldown and daily limits. If action_type is supplied, apply
         a per-type cooldown; otherwise fall back to the global cooldown."""
         now = time.time()
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.utcnow().strftime("%Y-%m-%d")  # UTC — Pi may lack NTP-synced localtime
         if self.data["actions_today_date"] != today:
             self.data["actions_today"] = 0
             self.data["actions_today_date"] = today
@@ -274,9 +289,11 @@ class State:
     def add_price(self, price):
         self.data["price_history"].append({"t": time.time(), "p": price})
         cutoff = time.time() - 60 * 86400
-        self.data["price_history"] = [x for x in self.data["price_history"] if x["t"] > cutoff]
-        # Don't save every time (too frequent), save periodically
-        if len(self.data["price_history"]) % 12 == 0:
+        ph = [x for x in self.data["price_history"] if x["t"] > cutoff]
+        if len(ph) > 500:  # hard cap regardless of age
+            ph = ph[-500:]
+        self.data["price_history"] = ph
+        if len(ph) % 12 == 0:
             self.save()
 
 # ============================================================
@@ -289,7 +306,7 @@ def fetch_price():
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.loads(r.read().decode())
             return d["ethereum"]["usd"], d["ethereum"].get("usd_24h_change", 0)
-    except:
+    except Exception:
         try:
             req = urllib.request.Request(BINANCE_URL, headers={"User-Agent":"LP-Daemon/1.0"})
             with urllib.request.urlopen(req, timeout=10) as r:
@@ -432,20 +449,43 @@ Criterios: ¿El IL se recuperará? ¿La tendencia lo justifica? ¿No estamos sob
 # ============================================================
 # EXECUTOR
 # ============================================================
-def execute_action(action, state, password=None, pk=None, dry_run=False):
+def _read_bot_config() -> dict:
+    """Read per-bot capital config from DATA_DIR/bot_config.json if present."""
+    cfg_file = DATA_DIR / "bot_config.json"
+    try:
+        with open(cfg_file) as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def execute_action(action, state, password=None, pk=None, dry_run=False, target_usd=None):
     """Execute an action via AutoBot.
 
     Prefers passing the already-decrypted private key via an anonymous pipe
     FD (``--pk-fd``) so the subprocess never sees the keystore password.
     Falls back to password-via-stdin only for backward compatibility.
+
+    target_usd: if set and > 0, caps the position size to this USD amount.
     """
     autobot = str(APP_DIR / "lp_autobot.py")
     pid = str(state.get("position_id", ""))
+
+    # Read per-bot capital config (written by the web UI) so the daemon
+    # honours the target even if the caller didn't pass it explicitly.
+    if target_usd is None or target_usd <= 0:
+        cfg = _read_bot_config()
+        t = cfg.get("target_usd")
+        if isinstance(t, (int, float)) and t > 0:
+            target_usd = float(t)
 
     if action["type"] == "rebalance":
         cmd = [sys.executable, autobot, "--rebalance", "-p", pid,
                "--price-lower", f"{action['lo']:.0f}",
                "--price-upper", f"{action['hi']:.0f}", "-y"]
+        if target_usd and target_usd > 0:
+            cmd += ["--target-usd", f"{target_usd:.2f}"]
     elif action["type"] == "exit_pool":
         cmd = [sys.executable, autobot, "--exit", "-p", pid,
                "--hold", action["hold"], "-y"]
@@ -453,6 +493,8 @@ def execute_action(action, state, password=None, pk=None, dry_run=False):
         cmd = [sys.executable, autobot, "--enter",
                "--price-lower", f"{action['lo']:.0f}",
                "--price-upper", f"{action['hi']:.0f}", "-y"]
+        if target_usd and target_usd > 0:
+            cmd += ["--target-usd", f"{target_usd:.2f}"]
     else:
         log(f"Unknown action type: {action['type']}", "ERROR")
         return False
@@ -720,6 +762,16 @@ def daemon_loop(args):
                 cw = (rhi-rlo)/((rlo+rhi)/2)*100
                 fee_est = 0.31 * (15.63/max(cw,1)) / (24*12)
                 state.data["total_fees"] = state.data.get("total_fees",0) + fee_est
+
+            # RAM tracking — read RSS once per cycle, keep 48-entry circular buffer (4h at 5min)
+            rss = _read_rss_kb()
+            if rss:
+                state.data["ram_rss_kb"] = rss
+                ram_hist = state.data.setdefault("ram_history", [])
+                ram_hist.append({"t": int(time.time()), "kb": rss})
+                state.data["ram_history"] = ram_hist[-48:]
+            state.data["last_cycle_at"] = time.time()
+            state.save()
 
             time.sleep(POLL_SECONDS)
 

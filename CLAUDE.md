@@ -40,6 +40,13 @@
   - Backtest search hardening (`2026-04-23`): walk-forward search should fail closed when too many candidate configs error, instead of silently selecting a winner from a badly degraded search window.
   - Desktop install path on the laptop is `~/.local/share/lp-ranger/app`. That installed copy can drift from the repo checkout if `install.sh` is not rerun or files are not manually synced.
   - Practical mismatch seen on `2026-04-23`: laptop config was using `strategy_optimal.json` while the Pi bot for position `5009590` was using `Exit Pool Strategy v1`. When desktop and Pi disagree, verify both the strategy file and the installed app copy before blaming the bot.
+  - Hardening and monitoring batch (`2026-04-24`):
+    - `lp_daemon.py`: `State._load()` bare `except` replaced by specific `json.JSONDecodeError`/`OSError` with WARN logs. `can_act()` now uses `datetime.utcnow()` for daily reset to avoid local-timezone drift on Pi. `price_history` now has a hard cap of 500 entries in addition to the 60-day TTL. `fetch_price()` outer `except` narrowed to `except Exception`. Bot ID validation (`bot_id.isdigit()`) was already present on all POST endpoints in `lp_web.py`.
+    - RAM monitoring: `lp_daemon.py` now reads `/proc/self/status` (VmRSS) each cycle and writes `ram_rss_kb` + a 48-entry circular `ram_history` (4 h at 5 min) into `daemon_state.json`. Also writes `last_cycle_at` timestamp for the web badge.
+    - Pi web UI RAM panel: `web/index.html` now shows current RSS + Unicode sparkline (▁▂▃▄▅▆▇█) from `ram_history` in each running-bot card. Color thresholds: >200 MB = amber, >400 MB = red.
+    - Pi web UI "last seen" badge: the running/stale tag in each card now includes the cycle age (`Xs ago` / `Xm ago`) so you can tell at a glance if the daemon is responding.
+    - Log collapsing in the console modal: consecutive "routine ok" lines (🟢/🟡, no errors/actions/strategy changes) are collapsed to `first … N identical ok lines … last`, keeping all signal and error lines visible. The full log is still downloadable unchanged.
+  - Capital control per bot (`2026-04-24`): the daemon now reads `/var/lib/lp-ranger/bots/<id>/.local/share/lp-ranger/bot_config.json` before each rebalance/enter and, if `target_usd` is set, passes `--target-usd` to the autobot. The Pi web UI exposes a "capital" button in each running-bot card (prompt → POST `/api/bots/{id}/config`). Setting it to empty restores "all available" behavior. This prevents the daemon from deploying more capital than intended when the wallet has leftover from prior runs.
 
 ## Overview
 Autonomous WETH/USDC liquidity pool manager for Uniswap V3 on Base chain. Detects signals, executes rebalances/exits/entries by signing on-chain transactions automatically.

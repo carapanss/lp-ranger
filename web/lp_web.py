@@ -173,6 +173,29 @@ def clear_bot_logs(bot_id: str) -> tuple[bool, str]:
     return True, f"cleared: {', '.join(cleared)}"
 
 
+def _bot_config_file(bot_id: str) -> Path:
+    return BOTS_DIR / bot_id / ".local" / "share" / "lp-ranger" / "bot_config.json"
+
+
+def read_bot_config(bot_id: str) -> dict:
+    try:
+        with _bot_config_file(bot_id).open() as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_bot_config(bot_id: str, config: dict) -> tuple[bool, str]:
+    path = _bot_config_file(bot_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config, indent=2))
+        return True, str(path)
+    except OSError as e:
+        return False, f"write failed: {e}"
+
+
 def _bot_strategy_name_file(bot_id: str) -> Path:
     return BOTS_DIR / bot_id / "strategy_name"
 
@@ -617,6 +640,7 @@ def read_state(bot_id: str) -> dict:
         "latest_error": latest_error,
         "error_acknowledged": error_acknowledged,
         "has_unseen_error": bool(latest_error and not error_acknowledged),
+        "bot_config": read_bot_config(bot_id),
     }
 
 
@@ -1087,6 +1111,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, read_state(bot_id))
             return
 
+        if path.startswith("/api/bots/") and path.endswith("/config"):
+            bot_id = unquote(path[len("/api/bots/"):-len("/config")])
+            if not bot_id.isdigit():
+                self._send_json(400, {"ok": False, "error": "invalid bot id"})
+                return
+            self._send_json(200, {"ok": True, "config": read_bot_config(bot_id)})
+            return
+
         if path.startswith("/api/bots/") and path.endswith("/download-log"):
             bot_id = unquote(path[len("/api/bots/"):-len("/download-log")])
             if not bot_id.isdigit():
@@ -1318,6 +1350,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "message": msg or "stopped"})
             else:
                 self._send_json(500, {"ok": False, "error": msg or "systemctl failed"})
+            return
+
+        if path.startswith("/api/bots/") and path.endswith("/config"):
+            bot_id = path[len("/api/bots/"):-len("/config")]
+            if not bot_id.isdigit():
+                self._send_json(400, {"ok": False, "error": "invalid bot id"})
+                return
+            body = self._read_json()
+            # Validate target_usd: null clears it, positive number sets it
+            target_usd = body.get("target_usd")
+            if target_usd is not None and not isinstance(target_usd, (int, float)):
+                self._send_json(400, {"ok": False, "error": "target_usd must be a number or null"})
+                return
+            if isinstance(target_usd, (int, float)) and target_usd <= 0:
+                self._send_json(400, {"ok": False, "error": "target_usd must be positive"})
+                return
+            cfg = read_bot_config(bot_id)
+            if target_usd is None:
+                cfg.pop("target_usd", None)
+            else:
+                cfg["target_usd"] = float(target_usd)
+            ok, msg = write_bot_config(bot_id, cfg)
+            if ok:
+                self._send_json(200, {"ok": True, "config": cfg})
+            else:
+                self._send_json(500, {"ok": False, "error": msg})
             return
 
         self._send_json(404, {"ok": False, "error": "not found"})

@@ -561,6 +561,29 @@
     return COOLDOWN_SECONDS - ((Date.now() / 1000) - lastActionTime);
   }
 
+  function fmtRam(kb) {
+    if (!kb || kb <= 0) return "—";
+    return (kb / 1024).toFixed(0) + " MB";
+  }
+
+  function ramSparkline(history) {
+    if (!history || history.length < 2) return "";
+    const vals = history.map(h => h.kb);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const range = max - min || 1;
+    const blocks = "▁▂▃▄▅▆▇█";
+    const spark = vals.slice(-16).map(v => blocks[Math.round(((v - min) / range) * (blocks.length - 1))]).join("");
+    return `<span title="RAM últimos ${vals.length} ciclos · mín ${fmtRam(min)} · máx ${fmtRam(max)}" style="font-size:0.8em;letter-spacing:-0.02em;color:var(--muted);margin-left:0.3em">${spark}</span>`;
+  }
+
+  function ramColor(kb) {
+    if (!kb) return "inherit";
+    if (kb > 400 * 1024) return "var(--bad)";
+    if (kb > 200 * 1024) return "var(--warn)";
+    return "inherit";
+  }
+
   function isValidWallet(s) {
     return /^0x[0-9a-fA-F]{40}$/.test(s || "");
   }
@@ -580,16 +603,47 @@
   }
 
   // --- Log rendering ---
+  function renderLine(line) {
+    const e = line.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    let cls = "log-line";
+    if (/\[ERROR\]|ERROR|FATAL/.test(line)) cls += " log-error";
+    else if (/\[WARN\]|WARN/.test(line)) cls += " log-warn";
+    else if (/AUTO-EXEC|EJECUTANDO|rebalance|Rebalance|exit.*pool|EXIT|ENTER|upgrading to auto|SIGNAL|EXECUTING/.test(line)) cls += " log-action";
+    else if (/unlocked|started|✓|green|Keystore/.test(line)) cls += " log-ok";
+    return `<span class="${cls}">${e}</span>`;
+  }
+
+  // Returns true for routine "all ok" status lines with no changes/errors/actions.
+  // Consecutive runs of these are collapsed in renderLog to reduce noise.
+  function isRoutineOk(line) {
+    if (/\[ERROR\]|ERROR|FATAL|\[WARN\]|WARN/.test(line)) return false;
+    if (/AUTO-EXEC|EJECUTANDO|rebalance|Rebalance|exit.*pool|EXIT|ENTER|SIGNAL|EXECUTING|unlocked|started|Keystore|strategy|Strategy|Auto-disc|Position updated|Wallet now|resyncing/.test(line)) return false;
+    return /[🟢🟡]/.test(line);
+  }
+
   function renderLog(lines) {
-    return (lines || []).map(line => {
-      const e = line.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-      let cls = "log-line";
-      if (/\[ERROR\]|ERROR|FATAL/.test(line)) cls += " log-error";
-      else if (/\[WARN\]|WARN/.test(line)) cls += " log-warn";
-      else if (/AUTO-EXEC|EJECUTANDO|rebalance|Rebalance|exit.*pool|EXIT|ENTER|upgrading to auto/.test(line)) cls += " log-action";
-      else if (/unlocked|started|✓|green|Keystore/.test(line)) cls += " log-ok";
-      return `<span class="${cls}">${e}</span>`;
-    }).join("\n");
+    if (!lines || !lines.length) return "";
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      if (!isRoutineOk(lines[i])) {
+        out.push(renderLine(lines[i]));
+        i++;
+      } else {
+        // Scan the full consecutive run
+        const start = i;
+        while (i < lines.length && isRoutineOk(lines[i])) i++;
+        const count = i - start;
+        if (count <= 2) {
+          for (let j = start; j < start + count; j++) out.push(renderLine(lines[j]));
+        } else {
+          out.push(renderLine(lines[start]));
+          out.push(`<span class="log-line" style="color:var(--muted);font-style:italic;opacity:.6">  ···  ${count - 2} líneas iguales ···</span>`);
+          out.push(renderLine(lines[i - 1]));
+        }
+      }
+    }
+    return out.join("\n");
   }
 
   function positionValueUsd(liquidity, tickLo, tickHi, priceUsdcPerEth) {
@@ -698,6 +752,10 @@
     const logAge = payload.log_last_modified
       ? (Date.now() / 1000) - payload.log_last_modified
       : null;
+    // Use last_cycle_at from state if available (more precise than log mtime)
+    const cycleAge = st.last_cycle_at
+      ? (Date.now() / 1000) - st.last_cycle_at
+      : logAge;
     const poolText = st.pool_active === false
       ? "📦 closed (" + (st.hold_asset || "?") + ")"
       : "active";
@@ -709,12 +767,21 @@
     const stratOpts = strategies.map(s =>
       `<option value="${s}"${s === strategyName ? " selected" : ""}>${s}</option>`
     ).join("");
+    const ramKb = st.ram_rss_kb || 0;
+    const ramLabel = ramKb ? `<span style="color:${ramColor(ramKb)}">${fmtRam(ramKb)}</span>${ramSparkline(st.ram_history)}` : "—";
+    const ageLabel = cycleAge != null ? fmtAgo(cycleAge) : "—";
+    const statusTag = payload.stale
+      ? `<span class="tag stale">stale · ${ageLabel}</span>`
+      : `<span class="tag live">${ageLabel}</span>`;
+    const cfg = payload.bot_config || {};
+    const targetUsd = typeof cfg.target_usd === "number" && cfg.target_usd > 0 ? cfg.target_usd : null;
+    const capitalLabel = targetUsd ? `<span style="color:var(--accent)">$${Math.round(targetUsd).toLocaleString()}</span>` : `<span style="color:var(--muted)">all available</span>`;
     return `
       <div class="hdr">
         <span>
           <span class="emoji">${lastEmoji(payload.log_tail)}</span>
           <span class="pid">#${id}</span>
-          ${payload.stale ? '<span class="tag stale">stale</span>' : '<span class="tag live">running</span>'}
+          ${statusTag}
           ${hasError ? '<span class="tag stale">error</span>' : ''}
         </span>
         <span class="tag">auto-execute</span>
@@ -722,7 +789,8 @@
       <dl>
         <dt>ETH</dt><dd>${fmtUSD(lastPrice)}</dd>
         <dt>Range</dt><dd>${fmtUSD(st.range_lo)} – ${fmtUSD(st.range_hi)}</dd>
-        <dt>Last log</dt><dd>${fmtAgo(logAge)}</dd>
+        <dt>RAM</dt><dd>${ramLabel}</dd>
+        <dt>Capital pool</dt><dd>${capitalLabel}</dd>
         <dt>Cooldown</dt><dd>${fmtDur(cooldownRemaining(st.last_action_time))}</dd>
         <dt>Pool</dt><dd>${esc(poolText)}</dd>
         <dt>Strategy</dt><dd>${esc(strategyName)}</dd>
@@ -735,6 +803,7 @@
       <div class="actions">
         <select data-strategy="${id}">${stratOpts}</select>
         <button class="ghost" data-action="set-strategy" data-id="${id}">apply strategy</button>
+        <button class="ghost" data-action="set-capital" data-id="${id}" title="Capital máximo a depositar en la pool">capital</button>
         <button data-action="console" data-id="${id}">full log</button>
         ${ackButton}
         <button class="danger" data-action="stop" data-id="${id}">stop</button>
@@ -1160,6 +1229,41 @@
         if (errEl) errEl.textContent = e.message || "ack failed";
         btn.disabled = false;
         btn.textContent = "seen";
+      }
+      return;
+    }
+    if (action === "set-capital") {
+      // Fetch current value to pre-fill the prompt
+      let current = null;
+      try {
+        const r = await api(`/api/bots/${encodeURIComponent(id)}/config`);
+        current = (r.config || {}).target_usd || null;
+      } catch { /* ignore */ }
+      const hint = current ? `Actual: $${Math.round(current)}` : "Actual: todo disponible";
+      const raw = prompt(
+        `Capital máximo a depositar en la pool (USD).\n${hint}\nDejar vacío = usar todo el saldo disponible.\nEjemplo: 500`,
+        current != null ? String(Math.round(current)) : ""
+      );
+      if (raw === null) return;  // cancelled
+      const val = raw.trim() === "" ? null : parseFloat(raw.trim());
+      if (val !== null && (isNaN(val) || val <= 0)) {
+        alert("Introduce un número positivo o deja vacío para usar todo el saldo.");
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = "guardando…";
+      try {
+        await api(`/api/bots/${encodeURIComponent(id)}/config`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target_usd: val }),
+        });
+        await refreshAll();
+      } catch (e) {
+        if (errEl) errEl.textContent = e.message || "error al guardar capital";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "capital";
       }
       return;
     }
