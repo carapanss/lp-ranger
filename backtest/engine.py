@@ -239,7 +239,9 @@ def run_backtest(cfg, candles, *,
         if pool_active and range_lo <= price <= range_hi:
             width_pct = (range_hi - range_lo) / ((range_lo + range_hi) / 2) * 100
             daily_fee = fee_daily_base * (fee_width_ref / max(width_pct, 1.0))
-            scale = (equity / 119.50) if equity > 0 else 1.0
+            # Scale by actual deployed pool capital, not total equity (which includes
+            # accumulated fee cash that is not reinvested into the position).
+            scale = (pool_mtm / position_usd) if pool_mtm > 0 else 1.0
             fee_this_tick = daily_fee * fee_per_tick_factor * scale
             total_fees += fee_this_tick
             cash_usd += fee_this_tick

@@ -501,6 +501,7 @@ def _finalize_strategy_snapshot(data: dict, state: dict | None, now: float, clos
     if not strategy or not isinstance(state, dict):
         return
     entry = _ensure_strategy_entry(data["entries"], strategy)
+
     fees_now = float(state.get("total_fees", 0) or 0)
     il_now = float(state.get("total_il", 0) or 0)
     prev_fees = float(current.get("last_fees_usd", fees_now) or fees_now)
@@ -515,20 +516,36 @@ def _finalize_strategy_snapshot(data: dict, state: dict | None, now: float, clos
         entry["il_usd"] += il_delta
     else:
         il_delta = 0.0
-    net_pnl_delta = fees_delta - il_delta
+
     snapshot = _position_snapshot(state)
+    cur_cap = snapshot.get("capital_usd")   # None when pool not active
+    prev_cap = float(current.get("last_capital_usd") or 0)
     flow_delta, flow_note = _cash_flow_delta(current, snapshot)
+
     if flow_delta is not None:
+        # Decompose capital change into market-driven (IL + price) vs external cash flow.
+        # _cash_flow_delta guarantees: flow_delta = cur_cap - prev_cap_at_current_price
+        # so prev_cap_at_current_price = cur_cap - flow_delta.
+        prev_cap_now = (float(cur_cap) - flow_delta) if cur_cap is not None else 0.0
+        capital_change = (prev_cap_now - prev_cap) if prev_cap > 0 else 0.0
+        net_pnl_delta = fees_delta + capital_change
         _apply_return_segment(entry, current, now, net_pnl_delta)
         _record_cash_flow(entry, now, flow_delta, "in" if flow_delta > 0 else "out", flow_note or "cash_flow")
-        current["base_capital_usd"] = max(0.0, float(current.get("base_capital_usd", 0) or 0) + flow_delta)
-        net_pnl_delta = 0.0
-    _apply_return_segment(entry, current, now, net_pnl_delta)
-    current["base_capital_usd"] = snapshot.get("capital_usd")
+        new_base = float(cur_cap) if cur_cap is not None else 0.0
+    else:
+        # Include capital change (IL + ETH price movement) so the TWR reflects total
+        # economic return, not just estimated fee income.  Guard: skip when cur_cap is
+        # None (pool not active) or prev_cap is unknown (first snapshot of a session).
+        capital_change = (float(cur_cap) - prev_cap) if (cur_cap is not None and prev_cap > 0) else 0.0
+        net_pnl_delta = fees_delta + capital_change
+        _apply_return_segment(entry, current, now, net_pnl_delta)
+        new_base = float(cur_cap) if cur_cap is not None else 0.0
+
+    current["base_capital_usd"] = new_base
     current["last_update_at"] = now
     current["last_fees_usd"] = fees_now
     current["last_il_usd"] = il_now
-    current["last_capital_usd"] = snapshot.get("capital_usd")
+    current["last_capital_usd"] = float(cur_cap) if cur_cap is not None else 0.0
     current["position_id"] = snapshot.get("position_id")
     current["position_liquidity"] = snapshot.get("liquidity")
     current["position_tick_lower"] = snapshot.get("tick_lower")
