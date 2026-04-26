@@ -689,15 +689,15 @@ def read_state(bot_id: str) -> dict:
         and int(ack.get("count", -1)) == latest_error["count"]
     )
 
-    effective_bot_id = _promote_live_bot_id(bot_id, live_position_id)
-    strategy_name = bot_strategy_name(effective_bot_id)
-    strategy_performance = update_strategy_performance(bot_id, state, strategy_name)
-
     live_position_id = None
     if isinstance(state, dict):
         pid = state.get("position_id")
         if pid is not None and str(pid).isdigit():
             live_position_id = str(pid)
+
+    effective_bot_id = _promote_live_bot_id(bot_id, live_position_id)
+    strategy_name = bot_strategy_name(effective_bot_id)
+    strategy_performance = update_strategy_performance(bot_id, state, strategy_name)
 
     return {
         "position_id": bot_id,
