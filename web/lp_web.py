@@ -700,8 +700,25 @@ def _rpc_for_pnl(method: str, params: list):
     return None
 
 
+_code_cache: dict[str, bool] = {}   # addr_lower → True if contract
+
+def _is_contract(addr: str) -> bool:
+    """Return True if addr has deployed bytecode (is a smart contract, not an EOA)."""
+    a = addr.lower()
+    if a not in _code_cache:
+        code = _rpc_for_pnl("eth_getCode", [addr, "latest"])
+        _code_cache[a] = isinstance(code, str) and len(code) > 4
+        time.sleep(0.04)
+    return _code_cache[a]
+
+
 def _scan_ext_transfers(wallet: str, from_block: int, to_block: int, eth_price: float) -> list[dict]:
-    """Return external USDC/WETH transfers (user deposits / withdrawals) in [from_block, to_block]."""
+    """Return external USDC/WETH transfers (user deposits / withdrawals) in [from_block, to_block].
+
+    Only counts transfers where the counterparty is an EOA (externally-owned account),
+    not a smart contract.  This correctly skips ALL Uniswap pool/router/manager
+    interactions regardless of which pool address or fee tier was used.
+    """
     if from_block > to_block or not wallet:
         return []
     wt = "0x" + wallet.lower().replace("0x", "").zfill(64)
@@ -724,17 +741,24 @@ def _scan_ext_transfers(wallet: str, from_block: int, to_block: int, eth_price: 
                         if len(t) < 3:
                             continue
                         counterparty = ("0x" + t[1][-40:]).lower() if direction == "in" else ("0x" + t[2][-40:]).lower()
+                        # Fast-path: known bot contracts
                         if counterparty in _BOT_ADDRS:
                             continue
+                        # Definitive check: skip if counterparty is any smart contract
+                        if _is_contract(counterparty):
+                            continue
                         amount = int(log.get("data", "0x0"), 16) / (10 ** dec)
-                        usd    = amount if sym == "USDC" else amount * eth_price
+                        if amount == 0:
+                            continue
+                        usd = amount if sym == "USDC" else amount * eth_price
                         found.append({
-                            "block":      int(log.get("blockNumber", "0x0"), 16),
-                            "tx":         log.get("transactionHash", ""),
-                            "token":      sym,
-                            "amount":     round(amount, 8),
-                            "amount_usd": round(usd, 4),
-                            "direction":  direction,
+                            "block":       int(log.get("blockNumber", "0x0"), 16),
+                            "tx":          log.get("transactionHash", ""),
+                            "token":       sym,
+                            "amount":      round(amount, 8),
+                            "amount_usd":  round(usd, 4),
+                            "direction":   direction,
+                            "counterparty": counterparty,
                         })
                 start = end + 1
                 time.sleep(0.06)
