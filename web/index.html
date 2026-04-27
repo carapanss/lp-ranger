@@ -639,6 +639,12 @@
     return sign + "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
+  function fmtMoneySign(n) {
+    if (n == null) return "—";
+    const sign = n >= 0 ? "+" : "";
+    return sign + "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
   function fmtPct(n) {
     if (n == null || !Number.isFinite(n)) return "—";
     const sign = n > 0 ? "+" : "";
@@ -894,8 +900,7 @@
     const lastPrice = st.price_history && st.price_history.length
       ? st.price_history[st.price_history.length - 1].p
       : null;
-    const perf = calcPerformance(payload, pos);
-    const strategyPerf = payload.strategy_performance || [];
+    const rp = payload.real_pnl || null;
     const logAge = payload.log_last_modified
       ? (Date.now() / 1000) - payload.log_last_modified
       : null;
@@ -952,9 +957,11 @@
         <dt>Cooldown</dt><dd>${fmtDur(cooldownRemaining(st.last_action_time))}</dd>
         <dt>Pool</dt><dd>${esc(poolText)}</dd>
         <dt>Strategy</dt><dd>${esc(strategyName)}</dd>
-        <dt>PnL</dt><dd>${fmtMoney(perf.pnlUsd)}</dd>
-        <dt>Gain</dt><dd>${fmtPct(perf.gainPct)}</dd>
-        <dt>APR now</dt><dd>${fmtPct(perf.aprPct)}</dd>
+        ${rp ? `
+        <dt>Cartera</dt><dd>${fmtMoney(rp.current_usd)}</dd>
+        <dt>PnL total</dt><dd style="color:${(rp.pnl_usd||0)>=0?'var(--good)':'var(--bad)'};font-weight:600">${fmtMoneySign(rp.pnl_usd)}${rp.pnl_pct!=null?' ('+fmtPct(rp.pnl_pct)+')':''}</dd>
+        <dt>PnL ${esc(rp.strategy||'estrategia')}</dt><dd style="color:${(rp.strategy_pnl_usd||0)>=0?'var(--good)':'var(--bad)'}">${rp.strategy_pnl_usd!=null?(fmtMoneySign(rp.strategy_pnl_usd)+(rp.strategy_pnl_pct!=null?' ('+fmtPct(rp.strategy_pnl_pct)+')':'')):'—'}</dd>
+        ` : '<dt>PnL</dt><dd>—</dd>'}
         <dt>Actions today</dt><dd>${st.actions_today || 0} / 3</dd>
         ${(ramKb || ramHist.length >= 2) ? `<div style="grid-column:1/-1;padding-top:0.4rem">${ramSummary}${ramChartSvg(ramHist)}</div>` : ''}
       </dl>
@@ -964,35 +971,11 @@
         <button class="ghost" data-action="set-strategy" data-id="${id}">apply strategy</button>
         <button class="ghost" data-action="set-capital" data-id="${effectiveId}" data-target-usd="${targetUsd ?? ""}" title="Capital máximo en la pool">capital</button>
         <button data-action="console" data-id="${id}">full log</button>
+        <button class="ghost" data-action="reset-pnl" data-id="${id}" title="Reiniciar contador de PnL desde cero">reset PnL</button>
         ${ackButton}
         <button class="danger" data-action="stop" data-id="${id}">stop</button>
       </div>
-      <div class="perf-note">Track: ${perf.trackedDays > 0 ? perf.trackedDays.toFixed(1) + " d" : "—"} · fees ${fmtMoney(payload.performance ? payload.performance.fees_usd : null)} · IL ${fmtMoney(payload.performance ? -Math.abs(payload.performance.il_usd || 0) : null)}</div>
-      ${strategyPerf.length ? `
-      <table class="perf-table">
-        <thead>
-          <tr>
-            <th>Strategy</th>
-            <th>APR TWR</th>
-            <th>TWR</th>
-            <th>PnL</th>
-            <th>Days</th>
-            <th>Flows</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${strategyPerf.slice(0, 4).map(row => `
-            <tr>
-              <td class="${row.is_current ? "current" : ""}">${esc(row.strategy)}${row.is_current ? " *" : ""}</td>
-              <td>${fmtPct(row.apr_pct)}</td>
-              <td>${fmtPct(row.twr_pct)}</td>
-              <td>${fmtMoney(row.pnl_usd)}</td>
-              <td>${Number(row.tracked_days || 0).toFixed(1)} d</td>
-              <td>${row.cash_flow_count ?? 0}</td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>` : ""}
+      ${rp ? `<div class="perf-note">Depositado: ${fmtMoney(rp.net_deposited_usd)} · ETH $${(rp.eth_price_usd||0).toFixed(0)} · ${rp.n_deposits} depósito${rp.n_deposits===1?'':'s'} detectado${rp.n_deposits===1?'':'s'}${!rp.scan_complete?' · escaneando…':''}</div>` : ''}
       <div class="err" id="err-${id}"></div>
     `;
   }
@@ -1158,45 +1141,26 @@
       await renderTo(active, posGrid);
       await renderTo(empty, emptyGrid);
 
+      // Wallet-level summary from real_pnl data
       const summaryStats = active.reduce((acc, p) => {
         if (!botsSet.has(p.id)) return acc;
         const payload = payloadById.get(p.id);
-        if (!payload) return acc;
-        const perf = calcPerformance(payload, p);
-        if (!(perf.capitalUsd > 0)) return acc;
+        const rp = payload && payload.real_pnl;
+        if (!rp || !(rp.current_usd > 0)) return acc;
         acc.bots += 1;
-        acc.capitalUsd += perf.capitalUsd;
-        acc.pnlUsd += perf.pnlUsd;
+        acc.capitalUsd += rp.current_usd;
+        acc.pnlUsd += rp.pnl_usd || 0;
+        acc.depositedUsd += rp.net_deposited_usd || 0;
         return acc;
-      }, { bots: 0, capitalUsd: 0, pnlUsd: 0 });
+      }, { bots: 0, capitalUsd: 0, pnlUsd: 0, depositedUsd: 0 });
 
       if (summaryStats.bots > 0 && summaryStats.capitalUsd > 0) {
-        summaryStats.gainPct = (summaryStats.pnlUsd / summaryStats.capitalUsd) * 100;
-        const daysWeighted = active.reduce((acc, p) => {
-          if (!botsSet.has(p.id)) return acc;
-          const payload = payloadById.get(p.id);
-          if (!payload) return acc;
-          const perf = calcPerformance(payload, p);
-          if (!(perf.capitalUsd > 0) || !(perf.trackedDays > 0)) return acc;
-          acc.weightedDays += perf.trackedDays * perf.capitalUsd;
-          acc.capitalUsd += perf.capitalUsd;
-          return acc;
-        }, { weightedDays: 0, capitalUsd: 0 });
-        const trackedDays = daysWeighted.capitalUsd > 0
-          ? daysWeighted.weightedDays / daysWeighted.capitalUsd
-          : 0;
-        summaryStats.aprPct = trackedDays > 0
-          ? summaryStats.gainPct * (365 / trackedDays)
+        summaryStats.gainPct = summaryStats.depositedUsd > 0
+          ? (summaryStats.pnlUsd / summaryStats.depositedUsd) * 100
           : null;
-        const botStrategyTables = [];
-        for (const p of active) {
-          if (!botsSet.has(p.id)) continue;
-          const payload = payloadById.get(p.id);
-          if (!payload || !(payload.strategy_performance || []).length) continue;
-          botStrategyTables.push(renderStrategyPerfTable(payload.strategy_performance, `TWR real por estrategia · bot #${p.id}`));
-        }
+        summaryStats.aprPct = null; // not enough data for APR without time tracking
 
-        walletSummary.innerHTML = renderWalletSummary(summaryStats) + botStrategyTables.join("");
+        walletSummary.innerHTML = renderWalletSummary(summaryStats);
         walletSummary.style.display = "";
       } else {
         walletSummary.style.display = "none";
@@ -1412,6 +1376,21 @@
     if (action === "set-capital") {
       const currentTargetUsd = btn.dataset.targetUsd ? parseFloat(btn.dataset.targetUsd) : null;
       openCapitalModal(id, Number.isFinite(currentTargetUsd) ? currentTargetUsd : null);
+      return;
+    }
+    if (action === "reset-pnl") {
+      btn.disabled = true;
+      btn.textContent = "reseteando…";
+      try {
+        await api(`/api/bots/${encodeURIComponent(id)}/pnl/reset`, { method: "POST" });
+        setBotMsg(id, "✅ PnL reiniciado — los datos nuevos empezarán a acumularse en el próximo ciclo", "var(--good)", 20000);
+        await refreshAll();
+      } catch (e) {
+        setBotMsg(id, "❌ " + (e.message || "error al resetear PnL"), "var(--bad)", 10000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "reset PnL";
+      }
       return;
     }
   });

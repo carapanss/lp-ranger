@@ -621,6 +621,235 @@ def close_strategy_performance_session(bot_id: str, state: dict | None) -> None:
             _save_strategy_performance(bot_id, data)
 
 
+# ── Real on-chain PnL ────────────────────────────────────────────────────────
+# Formula: PnL = current_portfolio_value − net_external_deposits
+# No estimates. Uses real balances written by the daemon + eth_getLogs for deposits.
+
+_REAL_PNL_LOCK = threading.Lock()
+
+# Transfers to/from these addresses are bot operations, not user deposits.
+_BOT_ADDRS = frozenset({
+    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC contract
+    "0x4200000000000000000000000000000000000006",  # WETH contract
+    "0x03a520b32c04bf3beef7beb72e919cf822ed34f1",  # NonfungiblePositionManager
+    "0x2626664c2603336e57b271c5c0b26f421741e481",  # SwapRouter02
+    "0xd0b53d9277642d899df5c87a3966a349a798f224",  # WETH/USDC 0.05% pool
+    "0x0000000000000000000000000000000000000000",  # zero address (wrap/unwrap)
+})
+_TRANSFER_SIG = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def _real_pnl_path(bot_id: str) -> Path:
+    return BOTS_DIR / bot_id / ".local" / "share" / "lp-ranger" / "real_pnl.json"
+
+
+def _load_real_pnl(bot_id: str) -> dict:
+    p = _real_pnl_path(bot_id)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {
+        "scanned_to_block": None,
+        "all_deposits": [],
+        "all_withdrawals": [],
+        "strategy_sessions": [],
+        "current_session": None,
+    }
+
+
+def _save_real_pnl(bot_id: str, data: dict) -> None:
+    try:
+        _real_pnl_path(bot_id).write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass
+
+
+def _compute_portfolio_usd_real(state: dict | None) -> float | None:
+    """Pool position value + free USDC + free WETH. No fee estimates."""
+    if not isinstance(state, dict):
+        return None
+    price = _state_price_usd(state)
+    if not price or price <= 0:
+        return None
+    liq = int(state.get("position_liquidity", 0) or 0)
+    tlo = state.get("position_tick_lower")
+    thi = state.get("position_tick_upper")
+    pool_val = 0.0
+    if liq and tlo is not None and thi is not None:
+        pv = _position_value_usd_from_parts(liq, tlo, thi, price)
+        pool_val = float(pv or 0)
+    usdc_free = float(state.get("wallet_usdc", 0) or 0)
+    weth_free = float(state.get("wallet_weth", 0) or 0)
+    return pool_val + usdc_free + weth_free * price
+
+
+def _rpc_for_pnl(method: str, params: list):
+    payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+    for url in BASE_RPC_ENDPOINTS:
+        try:
+            req = urllib.request.Request(url, data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "lp-pnl/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                result = json.loads(r.read())
+                if "result" in result:
+                    return result["result"]
+        except Exception:
+            continue
+    return None
+
+
+def _scan_ext_transfers(wallet: str, from_block: int, to_block: int, eth_price: float) -> list[dict]:
+    """Return external USDC/WETH transfers (user deposits / withdrawals) in [from_block, to_block]."""
+    if from_block > to_block or not wallet:
+        return []
+    wt = "0x" + wallet.lower().replace("0x", "").zfill(64)
+    CHUNK = 30_000
+    found = []
+    for token_addr, dec, sym in [(USDC, 6, "USDC"), (WETH, 18, "WETH")]:
+        for direction, t1, t2 in [("in", None, wt), ("out", wt, None)]:
+            start = from_block
+            while start <= to_block:
+                end = min(start + CHUNK - 1, to_block)
+                result = _rpc_for_pnl("eth_getLogs", [{
+                    "address": token_addr,
+                    "topics": [_TRANSFER_SIG, t1, t2],
+                    "fromBlock": hex(start),
+                    "toBlock": hex(end),
+                }])
+                if isinstance(result, list):
+                    for log in result:
+                        t = log.get("topics", [])
+                        if len(t) < 3:
+                            continue
+                        counterparty = ("0x" + t[1][-40:]).lower() if direction == "in" else ("0x" + t[2][-40:]).lower()
+                        if counterparty in _BOT_ADDRS:
+                            continue
+                        amount = int(log.get("data", "0x0"), 16) / (10 ** dec)
+                        usd    = amount if sym == "USDC" else amount * eth_price
+                        found.append({
+                            "block":      int(log.get("blockNumber", "0x0"), 16),
+                            "tx":         log.get("transactionHash", ""),
+                            "token":      sym,
+                            "amount":     round(amount, 8),
+                            "amount_usd": round(usd, 4),
+                            "direction":  direction,
+                        })
+                start = end + 1
+                time.sleep(0.06)
+    return sorted(found, key=lambda x: x["block"])
+
+
+def update_real_pnl(bot_id: str, state: dict | None, strategy_name: str | None) -> dict | None:
+    """Compute real PnL from on-chain data. Thread-safe. Returns summary or None."""
+    with _REAL_PNL_LOCK:
+        if not isinstance(state, dict):
+            return None
+        wallet    = state.get("wallet_address")
+        eth_price = _state_price_usd(state) or 0.0
+        if not wallet or eth_price <= 0:
+            return None
+        current_usd = _compute_portfolio_usd_real(state)
+        if current_usd is None:
+            return None
+
+        data = _load_real_pnl(bot_id)
+        now  = time.time()
+
+        # ── Incremental blockchain scan for external deposits ─────────────
+        cur_block_hex = _rpc_for_pnl("eth_blockNumber", [])
+        if cur_block_hex:
+            cur_block = int(cur_block_hex, 16)
+            scanned   = data.get("scanned_to_block")
+            if scanned is None:
+                # First run: estimate start block from tracking_started_at
+                track_ts = state.get("tracking_started_at")
+                if track_ts:
+                    blk_data = _rpc_for_pnl("eth_getBlockByNumber", [hex(cur_block), False])
+                    cur_ts   = int(blk_data.get("timestamp", "0x0"), 16) if isinstance(blk_data, dict) else now
+                    secs_back   = max(0, cur_ts - float(track_ts)) + 86400  # +1 day buffer
+                    blocks_back = min(int(secs_back * 2.1), 1_500_000)      # cap ~8 days
+                    from_block  = max(0, cur_block - blocks_back)
+                else:
+                    from_block = max(0, cur_block - 1_500_000)
+            else:
+                from_block = scanned + 1
+
+            if from_block <= cur_block:
+                new_txs  = _scan_ext_transfers(wallet, from_block, cur_block, eth_price)
+                seen_txs = {t["tx"] for t in data["all_deposits"] + data["all_withdrawals"]}
+                for t in new_txs:
+                    if t["tx"] not in seen_txs:
+                        bucket = "all_deposits" if t["direction"] == "in" else "all_withdrawals"
+                        data[bucket].append(t)
+                data["scanned_to_block"] = cur_block
+                _save_real_pnl(bot_id, data)
+
+        # ── Strategy session tracking ─────────────────────────────────────
+        cur_sess     = data.get("current_session") or {}
+        prev_strat   = cur_sess.get("strategy")
+        if strategy_name and strategy_name != prev_strat:
+            if prev_strat:
+                s_start_block = int(cur_sess.get("start_block", 0))
+                s_deps = sum(t["amount_usd"] for t in data["all_deposits"]  if t["block"] >= s_start_block)
+                s_wdrs = sum(t["amount_usd"] for t in data["all_withdrawals"] if t["block"] >= s_start_block)
+                s_pnl  = current_usd - float(cur_sess.get("start_value_usd", current_usd)) - s_deps + s_wdrs
+                data.setdefault("strategy_sessions", []).append({
+                    **cur_sess, "end_ts": now, "end_value_usd": current_usd, "pnl_usd": round(s_pnl, 4),
+                })
+            data["current_session"] = {
+                "strategy":       strategy_name,
+                "start_ts":       now,
+                "start_block":    data.get("scanned_to_block") or 0,
+                "start_value_usd": current_usd,
+            }
+            _save_real_pnl(bot_id, data)
+
+        # ── Totals ────────────────────────────────────────────────────────
+        total_dep = sum(t["amount_usd"] for t in data["all_deposits"])
+        total_wdr = sum(t["amount_usd"] for t in data["all_withdrawals"])
+        net_dep   = total_dep - total_wdr
+        overall   = current_usd - net_dep
+        ovr_pct   = (overall / net_dep * 100) if net_dep > 0 else None
+
+        strat_pnl = strat_pct = None
+        cs = data.get("current_session") or {}
+        if cs.get("start_value_usd") is not None:
+            sb   = int(cs.get("start_block", 0))
+            sv   = float(cs["start_value_usd"])
+            sdep = sum(t["amount_usd"] for t in data["all_deposits"]    if t["block"] >= sb)
+            swdr = sum(t["amount_usd"] for t in data["all_withdrawals"] if t["block"] >= sb)
+            strat_pnl = current_usd - sv - sdep + swdr
+            base      = sv + sdep
+            if base > 0:
+                strat_pct = strat_pnl / base * 100
+
+        return {
+            "current_usd":       round(current_usd, 2),
+            "net_deposited_usd": round(net_dep, 2),
+            "deposited_usd":     round(total_dep, 2),
+            "withdrawn_usd":     round(total_wdr, 2),
+            "pnl_usd":           round(overall, 2),
+            "pnl_pct":           round(ovr_pct, 2) if ovr_pct is not None else None,
+            "strategy":          cs.get("strategy"),
+            "strategy_pnl_usd":  round(strat_pnl, 2) if strat_pnl is not None else None,
+            "strategy_pnl_pct":  round(strat_pct, 2) if strat_pct is not None else None,
+            "strategy_start_ts": cs.get("start_ts"),
+            "n_deposits":        len(data["all_deposits"]),
+            "eth_price_usd":     round(eth_price, 2),
+            "scan_complete":     data.get("scanned_to_block") is not None,
+        }
+
+
+def reset_real_pnl(bot_id: str) -> None:
+    """Delete real_pnl.json so tracking restarts fresh on next request."""
+    try:
+        _real_pnl_path(bot_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def diagnostics_text(bot_id: str) -> str:
     payload = read_state(bot_id)
     state = payload.get("state") or {}
@@ -697,7 +926,7 @@ def read_state(bot_id: str) -> dict:
 
     effective_bot_id = _promote_live_bot_id(bot_id, live_position_id)
     strategy_name = bot_strategy_name(effective_bot_id)
-    strategy_performance = update_strategy_performance(bot_id, state, strategy_name)
+    real_pnl = update_real_pnl(bot_id, state, strategy_name)
 
     return {
         "position_id": bot_id,
@@ -707,8 +936,7 @@ def read_state(bot_id: str) -> dict:
         "log_last_modified": log_mtime,
         "stale": stale,
         "strategy_name": strategy_name,
-        "performance": performance_summary(state, state_file),
-        "strategy_performance": strategy_performance,
+        "real_pnl": real_pnl,
         "effective_bot_id": effective_bot_id,
         "latest_error": latest_error,
         "error_acknowledged": error_acknowledged,
@@ -1449,6 +1677,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "config": cfg})
             else:
                 self._send_json(500, {"ok": False, "error": msg})
+            return
+
+        if path.startswith("/api/bots/") and path.endswith("/pnl/reset"):
+            bot_id = path[len("/api/bots/"):-len("/pnl/reset")]
+            if not bot_id.isdigit():
+                self._send_json(400, {"ok": False, "error": "invalid bot id"})
+                return
+            reset_real_pnl(bot_id)
+            self._send_json(200, {"ok": True, "message": "PnL history reset — fresh tracking will start on next cycle"})
             return
 
         if path.startswith("/api/bots/") and path.endswith("/deploy-capital"):

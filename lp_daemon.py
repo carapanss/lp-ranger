@@ -61,6 +61,8 @@ _env_rpcs = os.environ.get("LP_RPC_ENDPOINTS", "")
 RPC_ENDPOINTS = [u.strip() for u in _env_rpcs.split(",") if u.strip()] or _DEFAULT_RPCS
 BASE_RPC = RPC_ENDPOINTS[0]
 POSITION_MANAGER = "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1"
+USDC_ADDR        = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+WETH_ADDR        = "0x4200000000000000000000000000000000000006"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd&include_24hr_change=true"
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDC"
 
@@ -299,6 +301,36 @@ class State:
 # ============================================================
 # PRICE & POSITION FETCHER
 # ============================================================
+def _rpc(method, params):
+    payload = json.dumps({"jsonrpc":"2.0","method":method,"params":params,"id":1}).encode()
+    last_err = None
+    for url in RPC_ENDPOINTS:
+        try:
+            req = urllib.request.Request(url, data=payload,
+                    headers={"Content-Type":"application/json","User-Agent":"LP-Daemon/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                r = json.loads(resp.read().decode())
+                if "result" in r:
+                    return r["result"]
+        except Exception as e:
+            last_err = e
+    return None
+
+
+def fetch_wallet_balances(wallet_addr):
+    """Return {wallet_usdc, wallet_weth} from on-chain balanceOf calls."""
+    padded = wallet_addr.lower().replace("0x", "").zfill(64)
+    out = {}
+    for key, token, dec in [("wallet_usdc", USDC_ADDR, 6), ("wallet_weth", WETH_ADDR, 18)]:
+        raw = _rpc("eth_call", [{"to": token, "data": "0x70a08231" + padded}, "latest"])
+        if raw:
+            try:
+                out[key] = int(raw, 16) / (10 ** dec)
+            except Exception:
+                pass
+    return out if out else None
+
+
 def fetch_price():
     try:
         req = urllib.request.Request(COINGECKO_URL,
@@ -695,6 +727,15 @@ def daemon_loop(args):
                     state.data["position_tick_lower"] = pos["tl"]
                     state.data["position_tick_upper"] = pos["tu"]
                     state.data["last_position_fetch_ts"] = time.time()
+                    state.save()
+
+            # 2c. Fetch real wallet token balances (same cadence as position)
+            if wallet_addr and (time.time() - state.data.get("last_balance_fetch_ts", 0)) >= pos_interval:
+                bals = fetch_wallet_balances(wallet_addr)
+                if bals:
+                    state.data.update(bals)
+                    state.data["wallet_address"] = wallet_addr
+                    state.data["last_balance_fetch_ts"] = time.time()
                     state.save()
 
             # 3. Evaluate strategy
