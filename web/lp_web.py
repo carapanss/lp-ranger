@@ -703,27 +703,45 @@ def _rpc_for_pnl(method: str, params: list):
 _code_cache: dict[str, bool] = {}   # addr_lower → True if contract
 
 def _is_contract(addr: str) -> bool:
-    """Return True if addr has deployed bytecode (is a smart contract, not an EOA)."""
     a = addr.lower()
     if a not in _code_cache:
         code = _rpc_for_pnl("eth_getCode", [addr, "latest"])
         _code_cache[a] = isinstance(code, str) and len(code) > 4
-        time.sleep(0.04)
+        time.sleep(0.03)
     return _code_cache[a]
 
 
-def _scan_ext_transfers(wallet: str, from_block: int, to_block: int, eth_price: float) -> list[dict]:
-    """Return external USDC/WETH transfers (user deposits / withdrawals) in [from_block, to_block].
+def _tx_initiator(tx_hash: str) -> str | None:
+    """Return the address that signed (initiated) a transaction."""
+    tx = _rpc_for_pnl("eth_getTransactionByHash", [tx_hash])
+    if isinstance(tx, dict):
+        return (tx.get("from") or "").lower()
+    return None
 
-    Only counts transfers where the counterparty is an EOA (externally-owned account),
-    not a smart contract.  This correctly skips ALL Uniswap pool/router/manager
-    interactions regardless of which pool address or fee tier was used.
+
+def _scan_ext_transfers(wallet: str, from_block: int, to_block: int, eth_price: float) -> list[dict]:
+    """Return only genuine user deposits/withdrawals in [from_block, to_block].
+
+    Classification logic:
+    - INCOMING transfer (someone → wallet):
+        If the TRANSACTION was initiated by the wallet itself (tx.from == wallet),
+        it's the bot collecting fees or removing liquidity — skip.
+        Otherwise it's an external party sending funds → user deposit.
+    - OUTGOING transfer (wallet → someone):
+        If the RECIPIENT is a smart contract → bot operation (pool/router) — skip.
+        If the recipient is an EOA → user withdrawal.
+
+    This handles CEX/bridge deposits correctly (they come from contracts but the
+    wallet did NOT initiate the tx), and filters all Uniswap pool interactions
+    regardless of pool address or fee tier.
     """
     if from_block > to_block or not wallet:
         return []
-    wt = "0x" + wallet.lower().replace("0x", "").zfill(64)
+    wallet_lower = wallet.lower()
+    wt    = "0x" + wallet_lower.replace("0x", "").zfill(64)
     CHUNK = 30_000
     found = []
+
     for token_addr, dec, sym in [(USDC, 6, "USDC"), (WETH, 18, "WETH")]:
         for direction, t1, t2 in [("in", None, wt), ("out", wt, None)]:
             start = from_block
@@ -731,33 +749,41 @@ def _scan_ext_transfers(wallet: str, from_block: int, to_block: int, eth_price: 
                 end = min(start + CHUNK - 1, to_block)
                 result = _rpc_for_pnl("eth_getLogs", [{
                     "address": token_addr,
-                    "topics": [_TRANSFER_SIG, t1, t2],
+                    "topics":  [_TRANSFER_SIG, t1, t2],
                     "fromBlock": hex(start),
-                    "toBlock": hex(end),
+                    "toBlock":   hex(end),
                 }])
                 if isinstance(result, list):
                     for log in result:
                         t = log.get("topics", [])
                         if len(t) < 3:
                             continue
-                        counterparty = ("0x" + t[1][-40:]).lower() if direction == "in" else ("0x" + t[2][-40:]).lower()
-                        # Fast-path: known bot contracts
-                        if counterparty in _BOT_ADDRS:
-                            continue
-                        # Definitive check: skip if counterparty is any smart contract
-                        if _is_contract(counterparty):
-                            continue
                         amount = int(log.get("data", "0x0"), 16) / (10 ** dec)
                         if amount == 0:
                             continue
+                        tx_hash = log.get("transactionHash", "")
+
+                        if direction == "in":
+                            # Skip if the WALLET initiated the transaction
+                            # (bot collecting fees / removing liquidity)
+                            initiator = _tx_initiator(tx_hash)
+                            if initiator == wallet_lower:
+                                continue
+                            counterparty = ("0x" + t[1][-40:]).lower()
+                        else:  # out
+                            # Skip if RECIPIENT is a smart contract (pool/router)
+                            counterparty = ("0x" + t[2][-40:]).lower()
+                            if counterparty in _BOT_ADDRS or _is_contract(counterparty):
+                                continue
+
                         usd = amount if sym == "USDC" else amount * eth_price
                         found.append({
-                            "block":       int(log.get("blockNumber", "0x0"), 16),
-                            "tx":          log.get("transactionHash", ""),
-                            "token":       sym,
-                            "amount":      round(amount, 8),
-                            "amount_usd":  round(usd, 4),
-                            "direction":   direction,
+                            "block":        int(log.get("blockNumber", "0x0"), 16),
+                            "tx":           tx_hash,
+                            "token":        sym,
+                            "amount":       round(amount, 8),
+                            "amount_usd":   round(usd, 4),
+                            "direction":    direction,
                             "counterparty": counterparty,
                         })
                 start = end + 1
