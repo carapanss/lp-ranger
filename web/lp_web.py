@@ -856,12 +856,30 @@ def update_real_pnl(bot_id: str, state: dict | None, strategy_name: str | None) 
             }
             _save_real_pnl(bot_id, data)
 
+        # ── Baseline: set once on first scan ────────────────────────────────
+        # Baseline = portfolio value when tracking first started + any new
+        # external deposits since then.  This gives PnL = "am I up or down
+        # since I started tracking?" without needing full historical data.
+        if data.get("baseline_usd") is None:
+            data["baseline_usd"]   = current_usd
+            data["baseline_ts"]    = now
+            data["baseline_block"] = data.get("scanned_to_block") or 0
+            _save_real_pnl(bot_id, data)
+
         # ── Totals ────────────────────────────────────────────────────────
-        total_dep = sum(t["amount_usd"] for t in data["all_deposits"])
-        total_wdr = sum(t["amount_usd"] for t in data["all_withdrawals"])
-        net_dep   = total_dep - total_wdr
-        overall   = current_usd - net_dep
-        ovr_pct   = (overall / net_dep * 100) if net_dep > 0 else None
+        total_dep    = sum(t["amount_usd"] for t in data["all_deposits"])
+        total_wdr    = sum(t["amount_usd"] for t in data["all_withdrawals"])
+        # Net new deposits SINCE baseline was set (ignore pre-baseline history)
+        baseline_blk = int(data.get("baseline_block") or 0)
+        new_dep      = sum(t["amount_usd"] for t in data["all_deposits"]
+                          if t["block"] >= baseline_blk)
+        new_wdr      = sum(t["amount_usd"] for t in data["all_withdrawals"]
+                          if t["block"] >= baseline_blk)
+        baseline_val = float(data.get("baseline_usd", current_usd))
+        net_dep      = total_dep - total_wdr   # for display/reference
+        overall      = current_usd - baseline_val - new_dep + new_wdr
+        ref_capital  = baseline_val + new_dep
+        ovr_pct      = (overall / ref_capital * 100) if ref_capital > 0 else None
 
         strat_pnl = strat_pct = None
         cs = data.get("current_session") or {}
@@ -877,9 +895,10 @@ def update_real_pnl(bot_id: str, state: dict | None, strategy_name: str | None) 
 
         return {
             "current_usd":       round(current_usd, 2),
-            "net_deposited_usd": round(net_dep, 2),
-            "deposited_usd":     round(total_dep, 2),
-            "withdrawn_usd":     round(total_wdr, 2),
+            "baseline_usd":      round(baseline_val, 2),
+            "baseline_ts":       data.get("baseline_ts"),
+            "new_deposits_usd":  round(new_dep, 2),
+            "net_deposited_usd": round(net_dep, 2),   # all-time reference
             "pnl_usd":           round(overall, 2),
             "pnl_pct":           round(ovr_pct, 2) if ovr_pct is not None else None,
             "strategy":          cs.get("strategy"),

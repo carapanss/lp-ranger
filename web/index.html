@@ -975,7 +975,7 @@
         ${ackButton}
         <button class="danger" data-action="stop" data-id="${id}">stop</button>
       </div>
-      ${rp ? `<div class="perf-note">Depositado: ${fmtMoney(rp.net_deposited_usd)} · ETH $${(rp.eth_price_usd||0).toFixed(0)} · ${rp.n_deposits} depósito${rp.n_deposits===1?'':'s'} detectado${rp.n_deposits===1?'':'s'}${!rp.scan_complete?' · escaneando…':''}</div>` : ''}
+      ${rp ? `<div class="perf-note">Desde ${rp.baseline_ts ? new Date(rp.baseline_ts*1000).toLocaleDateString() : '—'} · base ${fmtMoney(rp.baseline_usd)}${rp.new_deposits_usd>0?' · +'+fmtMoney(rp.new_deposits_usd)+' nuevos depósitos':''} · ETH $${(rp.eth_price_usd||0).toFixed(0)}${!rp.scan_complete?' · escaneando…':''}</div>` : ''}
       <div class="err" id="err-${id}"></div>
     `;
   }
